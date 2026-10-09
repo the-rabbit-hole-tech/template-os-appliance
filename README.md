@@ -35,9 +35,9 @@ Scaffold only: governance, CI and this README. No implementation yet.
 task build    # go build ./...
 task test     # go test ./...
 task lint     # gofmt check + golangci-lint + yamllint
-task license  # check MIT headers (golic)
+task license  # check Apache-2.0 headers (golic)
 ```
 
 ## ⚖️ License
 
-MIT (c) 2026 Shane
+Apache-2.0. See LICENSE and NOTICE; keep NOTICE in any copy or derivative.

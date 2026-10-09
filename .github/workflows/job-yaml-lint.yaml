@@ -20,9 +20,34 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Python
-        uses: actions/setup-python@v5
-      - name: YamlLint
+      # yamllint runs through a pinned uv binary rather than setup-python.
+      # A self-hosted runner's image may have no `python` on PATH at all, and
+      # setup-python with no version pinned just falls back to whatever is
+      # already there, so the step "succeeds" and the next one exits 127. uv
+      # is a prebuilt, checksum-checked binary; it fetches its own managed
+      # CPython, so the job depends on nothing the image does or doesn't
+      # carry, on either a GitHub-hosted or a self-hosted runner. Runners may
+      # be amd64 or arm64, and the runner user cannot write to
+      # /usr/local/bin, so both are worked out here.
+      - name: Install uv
+        env:
+          VERSION: 0.12.20
         run: |
-          pip install yamllint
-          yamllint .
+          set -euo pipefail
+          case "$(uname -m)" in
+            aarch64|arm64) TARGET=aarch64-unknown-linux-gnu; SHA256=8a7aad7bc76a2fae5151566ff3e43eacce0b2a113d5e4de3e4afe3e58fa2441e ;;
+            *)             TARGET=x86_64-unknown-linux-gnu;  SHA256=6590717592ace991ff83a63fef799e3ad9d33ecc8f96c5d6bdd732496e79337f ;;
+          esac
+          tarball="${RUNNER_TEMP}/uv-${TARGET}.tar.gz"
+          curl -sSfL -o "$tarball" \
+            "https://github.com/astral-sh/uv/releases/download/${VERSION}/uv-${TARGET}.tar.gz"
+          echo "${SHA256}  ${tarball}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "$tarball" -C "${RUNNER_TEMP}/bin" --strip-components=1 "uv-${TARGET}/uv"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/bin/uv" --version
+      # Pinned, so a yamllint release can't turn a green tree red.
+      - name: YamlLint
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: uv tool run --python 3.13 --from yamllint==1.38.0 yamllint .

@@ -4,8 +4,8 @@ vars:
   TESTPARALLELISM: 4
   GOLIC_VERSION: v0.3.0
   GOLANGCI_VERSION: v2.12.2
-  COMMON_LIC: "2026 Shane"
-  TEMPLATE_LIC: "mit"
+  COMMON_LIC: "2026 The Rabbit Hole Tech, LLC"
+  TEMPLATE_LIC: "spdx-apache2"
 tasks:
   default:
     cmds:
@@ -43,12 +43,12 @@ tasks:
       - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_VERSION}}
       - go install golang.org/x/tools/cmd/goimports@latest
   license:
-    desc: Verify every source file carries the MIT license header (CI; never writes).
+    desc: Verify every source file carries the Apache-2.0 license header (CI; never writes).
     cmds:
       - go install github.com/Bugs5382/golic/cmd/golic@{{.GOLIC_VERSION}}
       - golic inject -t {{.TEMPLATE_LIC}} -c "{{.COMMON_LIC}}" --dry -x
   license:fix:
-    desc: Inject the MIT header into any source file missing it.
+    desc: Inject the Apache-2.0 header into any source file missing it.
     cmds:
       - go install github.com/Bugs5382/golic/cmd/golic@{{.GOLIC_VERSION}}
       - golic inject -t {{.TEMPLATE_LIC}} -c "{{.COMMON_LIC}}"
