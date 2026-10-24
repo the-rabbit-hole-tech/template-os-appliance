@@ -81,10 +81,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      GOSEC_VERSION: 2.29.0
+      GOSEC_VERSION: 2.30.0
       # SHA-256 of gosec_<version>_linux_amd64.tar.gz, from the release's
       # gosec_<version>_checksums.txt. Update it together with GOSEC_VERSION.
-      GOSEC_SHA256: 6431b119741c1f4a50fdfcf94e782e16b9e642afc8c7fa9b5d39d48bf3003095
+      GOSEC_SHA256: 3fcce2c4e802ff4169217874602a7df355e9a37bcb6ffaa34b08f3d5f336cdfb
     steps:
       - name: Checkout
         uses: actions/checkout@v6
