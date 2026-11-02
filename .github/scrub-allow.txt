@@ -1,0 +1,6 @@
+# Reviewed scrub allowlist: `<class> <exact value> <path glob>`, with a reason on the line or
+# the line above. The local pre-push scrub gate reads it at the remote's default branch, so a
+# new entry counts only once its own PR is merged.
+#
+# protoc-gen-connect-go writes this phrase into the version check of every generated client.
+ai-tell generated%20with gen/*.go
