@@ -1,0 +1,44 @@
+# Copyright 2026 The Example Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# THROWAWAY, LAB ONLY: a hello-world workload that shows k0s runs on the
+# box, until appliance-platformd deploys the real platform (#99), which
+# removes it. It ships in the lab product bundle (build/lab/stacks), and
+# k0s applies it from /var/lib/k0s/manifests/hello/. Its Deployment is
+# the lab product's front phase (build/lab/stacks/lab-front,
+# build/lab/product.yaml), which starts only once the data phase
+# (build/lab/stacks/lab-data) is Ready. It answers "hello from
+# appliance" on NodePort 30080, which the edge stack serves
+# on 443 (build/lab/stacks/edge). The page loads the box-state poller
+# (/_box/poll.js), so an open tab shows the box-state page through a
+# reboot and comes back by itself (docs/edge-fallback.md).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: appliance-hello
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello
+  namespace: appliance-hello
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en"><head><meta charset="utf-8"><title>hello</title>
+    <script src="/_box/poll.js" defer></script></head>
+    <body><p>hello from appliance</p></body></html>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: appliance-hello
+spec:
+  type: NodePort
+  selector:
+    app: hello
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080

@@ -1,0 +1,232 @@
+# Copyright 2026 The Example Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# INTERIM, until Traefik comes with the platform (#102): a minimal edge
+# that serves the product (and, in a lab bundle, the hello stack) on the
+# box's normal ports. The Appliance product bundle carries it on every
+# channel (build/product/appliance/render.sh).
+# Traefik runs on the host network and listens on 443 (TLS with the
+# certificate the box hands in as the box-tls Secret: the one assigned to
+# the Product (443) endpoint, else the box's own :8443 one; without it
+# Traefik's own self-signed default) and on 80,
+# which redirects to https. It forwards to the hello NodePort on the node
+# address. accessd opens 80 and 443 on the service interface once the
+# product bundle is installed (docs/k0s.md). Ping has its own entry point
+# on 127.0.0.1:9000 (spec 3), where the kubelet probes it: Traefik's ping
+# router has no TLS, so over HTTPS on 443 the hello route would take it.
+# /_box/ goes to appliance-edgefall on 127.0.0.1:9180 (the host's loopback:
+# Traefik is on the host network), and when the hello pod doesn't answer
+# (502 to 504) the edge serves edgefall's box-state page instead of its
+# own error (docs/edge-fallback.md). Every request on 443 passes
+# edgefall's gate first (box-gate, a forwardAuth on the websecure entry
+# point): while the box says starting or updating, which it does until the
+# product is ready after k0s starts and through a product apply or revert,
+# each request gets the box-state page with 503 instead of the product.
+# The product's charts publish their routes as Ingresses of the class
+# traefik in the appliance namespace, which Traefik reads with the
+# kubernetesingress provider. Its role is cluster-wide (the product's
+# namespace belongs to the product stack, which may not exist yet) and
+# read-only but for the Ingress status; the provider watches the appliance
+# namespace only. Every router on 443 terminates TLS, so an Ingress without
+# a tls block gets box-tls too; the hello route has the lowest priority, so
+# a product Ingress for / wins.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: appliance-edge
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: traefik
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: traefik.io/ingress-controller # scrub:allow=fqdn
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge
+  namespace: appliance-edge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: appliance-edge
+rules:
+  - apiGroups: [""]
+    resources: [nodes, services, secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, ingressclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: appliance-edge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: appliance-edge
+subjects:
+  - kind: ServiceAccount
+    name: edge
+    namespace: appliance-edge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge
+  namespace: appliance-edge
+data:
+  dynamic.yaml: |
+    http:
+      routers:
+        box:
+          rule: PathPrefix(`/_box/`)
+          priority: 1000
+          entryPoints: [websecure]
+          service: box
+          tls: {}
+        hello:
+          rule: PathPrefix(`/`)
+          priority: 1
+          entryPoints: [websecure]
+          service: hello
+          middlewares: [box-page]
+          tls: {}
+      middlewares:
+        box-gate:
+          forwardAuth:
+            address: http://127.0.0.1:9180/_box/gate
+        box-page:
+          errors:
+            status: ["502-504"]
+            service: box
+            query: /_box/page
+        # A generic path-prefix strip a product may route a prefixed path
+        # to its own service through: useful for a component whose own
+        # library builds URLs assuming it's mounted at the root (an OAuth
+        # issuer at https://<fqdn>/oauth, say), so the prefix comes off on
+        # the way in.
+        strip-prefix:
+          stripPrefix:
+            prefixes: ["/oauth"]
+      services:
+        box:
+          loadBalancer:
+            servers:
+              - url: http://127.0.0.1:9180
+        hello:
+          loadBalancer:
+            servers:
+              - url: http://198.18.0.1:30080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge
+  namespace: appliance-edge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: edge
+  template:
+    metadata:
+      labels:
+        app: edge
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: edge
+      automountServiceAccountToken: true
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: traefik
+          image: docker.io/library/traefik@sha256:e849695bc5c317da0cec22bfee4794fd9e15871fe554f864d31b625983e883ff
+          imagePullPolicy: Never
+          # edgefall holds 80 and 443 from k0s's start until the edge asks
+          # for them on its loopback listener, so the product URL shows the
+          # box-state page instead of refusing while the edge comes up
+          # (docs/edge-fallback.md). Traefik asks right before it execs, so
+          # 443 is free only while it binds; the answer comes once they're
+          # let go, and without edgefall the ask fails and Traefik starts
+          # anyway.
+          command:
+            - /bin/sh
+            - -c
+            - 'wget -q -T 5 -O /dev/null --post-data= http://127.0.0.1:9180/_box/edge-handoff || true; exec traefik "$@"'
+            - traefik
+          args:
+            - --entryPoints.web.address=:80
+            - --entryPoints.web.http.redirections.entryPoint.to=websecure
+            - --entryPoints.web.http.redirections.entryPoint.scheme=https
+            - --entryPoints.websecure.address=:443
+            - --entryPoints.websecure.http.tls=true
+            - --entryPoints.websecure.http.middlewares=box-gate@file
+            - --entryPoints.traefik.address=127.0.0.1:9000
+            - --providers.file.directory=/etc/traefik/dynamic
+            - --providers.file.watch=true
+            - --providers.kubernetesingress
+            - --providers.kubernetesingress.ingressClass=traefik
+            - --providers.kubernetesingress.namespaces=appliance
+            - --global.checkNewVersion=false
+            - --global.sendAnonymousUsage=false
+            - --ping=true
+            - --ping.entryPoint=traefik
+          readinessProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /ping
+              port: 9000
+              scheme: HTTP
+          securityContext:
+            # Root only to bind 80 and 443 on the host network; every other
+            # capability is dropped.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: dynamic
+              mountPath: /etc/traefik/dynamic
+              readOnly: true
+      # The routes (the edge ConfigMap) and the default certificate (the
+      # box-tls Secret's traefik-tls.yaml, which k0s-interim and the
+      # Certificates page's Product (443) assignment write) in one
+      # directory: Traefik's file provider watches it, so a new
+      # certificate is served as soon as the kubelet updates the volume,
+      # with no restart. Without the Secret Traefik serves its own default.
+      volumes:
+        - name: dynamic
+          projected:
+            sources:
+              - configMap:
+                  name: edge
+              - secret:
+                  name: box-tls
+                  optional: true
+                  items:
+                    - key: traefik-tls.yaml
+                      path: tls.yaml
