@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en" data-appliance-box="{{.State}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{.Title}}</title>
+<style>{{.Style}}</style>
+</head>
+<body>
+<main class="box" role="status" aria-live="polite">
+{{if .LogoURI}}<img class="logo" src="{{.LogoURI}}" alt="Appliance">{{else}}<p class="mark">Appliance</p>{{end}}
+<div class="spin" aria-hidden="true"></div>
+<h1 id="appliance-box-title">{{.Title}}</h1>
+<p id="appliance-box-note">{{.Note}}</p>
+{{if .Detail}}<p id="appliance-box-detail">{{.Detail}}</p>{{end}}
+</main>
+<script src="/_box/poll.js"></script>
+</body>
+</html>

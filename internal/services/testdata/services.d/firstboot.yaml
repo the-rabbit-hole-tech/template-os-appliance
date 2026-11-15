@@ -1,0 +1,4 @@
+exec: /usr/libexec/appliance/firstboot
+phases: [firstboot]
+after: [console]
+restart: on-failure

@@ -1,0 +1,169 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osadmin
+
+import (
+	"context"
+	"io/fs"
+	"net/http"
+	"path"
+	"strings"
+	"time"
+
+	"connectrpc.com/connect"
+	log "github.com/Bugs5382/go-log"
+
+	initv1 "example.org/appliance/gen/go/appliance/init/v1"
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/internal/boxstate"
+)
+
+// The box's phases, as GetPhase and GetStatus answer them.
+const (
+	// PhaseFirstBoot runs until setup's Finish.
+	PhaseFirstBoot = "firstboot"
+	// PhaseNormal follows.
+	PhaseNormal = "normal"
+)
+
+// SetupPath is the setup stepper's page, the only page served before
+// setup is done.
+const SetupPath = "/setup"
+
+// Phase is the box's phase.
+func (s *Server) Phase() string {
+	if s.SetupDone() {
+		return PhaseNormal
+	}
+	return PhaseFirstBoot
+}
+
+func (h *status) GetPhase(ctx context.Context, _ *connect.Request[osadminv1.GetPhaseRequest]) (*connect.Response[osadminv1.GetPhaseResponse], error) {
+	p := h.s.Phase()
+	running := h.s.productRunning(ctx)
+	st := h.s.boxState(p, running)
+	res := &osadminv1.GetPhaseResponse{
+		Phase: p, State: string(st), ProductRunning: running,
+		ProductInstalled: h.s.slots().Status().Installed != "",
+		UpgradeProgress:  h.s.publicProgress(),
+	}
+	// A failed product's phase and why, as edgefall is pushed them, so an
+	// edgefall that restarted while the box is failed serves them at once.
+	if st == boxstate.Failed {
+		res.FailedPhase, res.FailedReason = h.s.productFailure()
+	}
+	return connect.NewResponse(res), nil
+}
+
+// boxState is what the box is doing, as the product edge's box-state page
+// shows it. An update holds over the reboot it ends in, so the page says
+// why the box went away; init's announcement of a reboot or a shutdown
+// holds over everything else. A product apply or revert stays updating
+// until the product is ready, and after k0s starts the box stays starting
+// until the product is ready: the edge keeps every product request on the
+// box-state page until then. A product that failed to come up, or that a
+// cut-off reset holds, says failed, and one an import holds says
+// maintenance.
+func (s *Server) boxState(phase string, productRunning bool) boxstate.State {
+	announced := boxstate.State("")
+	if s.o.BoxStateFile != "" {
+		announced = boxstate.Read(s.o.BoxStateFile)
+	}
+	switch {
+	case s.Maintenance():
+		return boxstate.Updating
+	case announced != "":
+		return announced
+	case s.resetCutOffNote() != "":
+		return boxstate.Failed
+	case phase != PhaseNormal || !productRunning:
+		s.productReadyNow(productRunning)
+		return boxstate.Starting
+	case s.productComingUp():
+		s.followIfNone()
+		return boxstate.Updating
+	}
+	ready := s.productReadyNow(productRunning)
+	switch {
+	case ready:
+		return boxstate.Running
+	case s.productFailedNow():
+		return boxstate.Failed
+	case s.productHeldNow():
+		return boxstate.Maintenance
+	default:
+		return boxstate.Starting
+	}
+}
+
+// productStatusTimeout bounds asking init about the product's service, so
+// a slow init doesn't hold up the public GetPhase.
+const productStatusTimeout = 2 * time.Second
+
+// productRunning asks init whether the product's service runs; with no
+// answer it doesn't.
+func (s *Server) productRunning(ctx context.Context) bool {
+	if s.o.Services == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, productStatusTimeout)
+	defer cancel()
+	r, err := s.o.Services.Status(ctx, connect.NewRequest(&initv1.StatusRequest{Name: ProductService}))
+	if err != nil {
+		s.o.Logger.Debug("osadmin: the product service's state isn't known", log.F("error", err.Error()))
+		return false
+	}
+	return r.Msg.GetRunning()
+}
+
+// PagesHandler is StaticHandler gated on the phase: while phase answers
+// PhaseFirstBoot, every page path but /setup (/, the sign-in page,
+// included) is redirected to /setup. The files the pages load are served
+// in every phase. When phase fails the pages are served as they are; the
+// API refuses what the phase doesn't allow either way.
+func PagesHandler(assets fs.FS, phase func(*http.Request) (string, error), lg log.Logger) http.Handler {
+	if lg == nil {
+		lg = log.Nop()
+	}
+	static := StaticHandler(assets)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == SetupPath || r.URL.Path == SetupPath+"/" || isAsset(assets, r.URL.Path) {
+			static.ServeHTTP(w, r)
+			return
+		}
+		p, err := phase(r)
+		if err != nil {
+			lg.Warn("osadmin: the phase isn't known; the page is served", log.F("path", r.URL.Path), log.F("error", err.Error()))
+			static.ServeHTTP(w, r)
+			return
+		}
+		if p == PhaseFirstBoot {
+			lg.Debug("osadmin: setup isn't done; the page goes to /setup", log.F("path", r.URL.Path))
+			http.Redirect(w, r, SetupPath, http.StatusFound)
+			return
+		}
+		static.ServeHTTP(w, r)
+	})
+}
+
+// isAsset is whether p names one of the pages' files: anything but the
+// index (the page every route is served from) and a directory.
+func isAsset(assets fs.FS, p string) bool {
+	if assets == nil {
+		return false
+	}
+	name := strings.TrimPrefix(path.Clean(p), "/")
+	if name == "" || name == "." || name == "index.html" {
+		return false
+	}
+	st, err := fs.Stat(assets, name)
+	return err == nil && !st.IsDir()
+}
+
+// productFailedNow is whether a phase of the product failed since k0s
+// last started.
+func (s *Server) productFailedNow() bool {
+	_, why := s.productFailure()
+	return why != ""
+}

@@ -1,0 +1,7 @@
+exec: /usr/bin/k0s
+args: [controller, --enable-worker, --no-taints, --config, /run/appliance/k0s/k0s.yaml, --data-dir, /var/lib/k0s]
+phases: [normal]
+after: [platformd]
+restart: always
+pre-start: [/usr/libexec/appliance/platformd, prepare]
+stop-timeout: 2m

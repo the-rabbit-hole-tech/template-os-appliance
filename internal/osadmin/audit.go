@@ -1,0 +1,97 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osadmin
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+
+	"connectrpc.com/connect"
+	log "github.com/Bugs5382/go-log"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/gen/go/appliance/osadmin/v1/osadminv1connect"
+	"example.org/appliance/internal/codes"
+	"example.org/appliance/internal/osaudit"
+)
+
+type audit struct {
+	osadminv1connect.UnimplementedAuditServiceHandler
+	s *Server
+}
+
+func (h *audit) ListEvents(_ context.Context, r *connect.Request[osadminv1.ListEventsRequest]) (*connect.Response[osadminv1.ListEventsResponse], error) {
+	limit := int(r.Msg.GetLimit())
+	if limit <= 0 {
+		limit = 100
+	}
+	limit = min(limit, 500)
+	skip := 0
+	if t := r.Msg.GetPageToken(); t != "" {
+		n, err := strconv.Atoi(t)
+		if err != nil || n < 0 {
+			return nil, codes.New(codes.AccessForbidden, "the page token isn't one this box issued")
+		}
+		skip = n
+	}
+	out := &osadminv1.ListEventsResponse{ChainOk: true}
+	if err := h.s.o.Audit.Verify(); err != nil {
+		out.ChainOk, out.ChainError = false, err.Error()
+	}
+	all, err := h.s.o.Audit.Entries()
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(all)
+	var match []osaudit.Entry
+	for _, e := range all {
+		if strings.HasPrefix(e.Action, r.Msg.GetAction()) {
+			match = append(match, e)
+		}
+	}
+	for i := skip; i < len(match) && i < skip+limit; i++ {
+		e := match[i]
+		out.Events = append(out.Events, &osadminv1.AuditEvent{
+			Time: timestamppb.New(e.Time), Actor: e.Actor, KeyFingerprint: e.KeyFP, SourceAddress: e.Source,
+			Action: e.Action, Target: e.Target, Outcome: e.Outcome, Code: e.Code, Detail: e.Detail,
+		})
+	}
+	if skip+limit < len(match) {
+		out.NextPageToken = strconv.Itoa(skip + limit)
+	}
+	return connect.NewResponse(out), nil
+}
+
+// exportAudit streams every day file, oldest first, as JSON lines: the log
+// as written, so the chain verifies off the box too.
+func (s *Server) exportAudit(w http.ResponseWriter, r *http.Request) {
+	sess, err := s.session(r.Header)
+	if err == nil {
+		_, err = s.liveRole(sess)
+	}
+	entry := osaudit.Entry{Actor: sess.Admin, Source: hostOf(r.RemoteAddr), Action: "audit.export"}
+	if err != nil {
+		s.write(entry, err)
+		http.Error(w, codes.Describe(err), http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("Content-Disposition", `attachment; filename="os-audit.jsonl"`)
+	s.write(entry, nil)
+	files := 0
+	if err := s.o.Audit.ReadFiles(func(_ string, f io.Reader) error {
+		files++
+		_, err := io.Copy(w, f)
+		return err
+	}); err != nil {
+		s.o.Logger.Warn("osadmin: audit export interrupted", log.F("error", err.Error()))
+		return
+	}
+	s.o.Logger.Info("osadmin: audit log exported", log.F("admin", sess.Admin), log.F("files", files))
+}

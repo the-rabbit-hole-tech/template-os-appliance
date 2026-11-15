@@ -1,0 +1,643 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osadmin_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"filippo.io/age"
+
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/gen/go/appliance/osadmin/v1/osadminv1connect"
+	"example.org/appliance/internal/osadmin"
+	"example.org/appliance/internal/release"
+	"example.org/appliance/internal/switchroot"
+	"example.org/appliance/internal/testpki"
+	"example.org/appliance/internal/updatepkg"
+)
+
+// bin makes a .bin the way the release workflow does, from a layout
+// directory holding one file.
+func bin(t *testing.T, sign testpki.ECKey, enc *age.X25519Identity, h updatepkg.Header) []byte {
+	t.Helper()
+	layout := t.TempDir()
+	if err := os.WriteFile(filepath.Join(layout, "oci-layout"), []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var payload, ct, out bytes.Buffer
+	if err := updatepkg.TarDir(layout, &payload); err != nil {
+		t.Fatal(err)
+	}
+	h, err := updatepkg.Encrypt(&payload, h, enc.Recipient(), &ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, err := h.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updatepkg.Seal(&out, hdr, sign.BlobBundle(t, hdr), &ct); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func full(channel string) updatepkg.Header {
+	return updatepkg.Header{Version: "0.2.0", Arch: "amd64", Kind: updatepkg.KindFull, Channel: channel}
+}
+
+func (br *browser) upgrade() osadminv1connect.UpgradeServiceClient {
+	return osadminv1connect.NewUpgradeServiceClient(br.hc, br.b.ts.URL)
+}
+
+func (br *browser) upload(t *testing.T, body []byte) (string, int) {
+	t.Helper()
+	resp, err := br.hc.Post(br.b.ts.URL+"/upload", "application/octet-stream", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var out struct {
+		UploadID string `json:"uploadId"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.UploadID, resp.StatusCode
+}
+
+func stage(br *browser, id string) error {
+	_, err := br.upgrade().StageUpdate(context.Background(), connect.NewRequest(&osadminv1.StageUpdateRequest{UploadId: id}))
+	return err
+}
+
+// unpacked reports whether any upload was unpacked.
+func (b *box) unpacked(t *testing.T) bool {
+	t.Helper()
+	dirs, _ := filepath.Glob(filepath.Join(b.state, "osadmin-api", "uploads", "*.d"))
+	return len(dirs) > 0 || b.keyReads > 0
+}
+
+func TestUploadVerifyThenStage(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	id, code := alice.upload(t, bin(t, b.sign, b.enc, full(release.ChannelProduction)))
+	if code != http.StatusOK || id == "" {
+		t.Fatalf("upload %d %q", code, id)
+	}
+	if err := stage(alice, id); err != nil {
+		t.Fatal(err)
+	}
+	if b.keyReads != 1 || len(b.init.staged) != 1 {
+		t.Fatalf("decrypted once, staged once: %d %v", b.keyReads, b.init.staged)
+	}
+	if !b.init.layoutSeen {
+		t.Fatal("init stages the unpacked layout")
+	}
+	g, err := alice.upgrade().GetUpgrades(context.Background(), connect.NewRequest(&osadminv1.GetUpgradesRequest{}))
+	if err != nil || g.Msg.GetPolicy().GetWindowStart() != osadmin.DefaultPolicy().WindowStart || g.Msg.GetStagedVersion() != "0.2.0" || !g.Msg.GetAirGapped() || len(g.Msg.GetHistory()) != 1 || g.Msg.GetHistory()[0].GetOutcome() != "ok" {
+		t.Fatalf("%v %v", g, err)
+	}
+	if e := lastEntry(t, b.log, "upgrade.stage"); e.Outcome != "ok" || e.Detail["version"] != "0.2.0" {
+		t.Fatalf("%+v", e)
+	}
+}
+
+// A stage removes its .bin and the unpacked layout once init has staged
+// it, and audits the older release init removed to make room.
+func TestAStageRemovesItsFilesAndAuditsTheOlderRelease(t *testing.T) {
+	b := newBox(t, false)
+	b.init.removes = []string{"0.0.9"}
+	alice := b.browser()
+	alice.signIn("alice")
+	id, _ := alice.upload(t, bin(t, b.sign, b.enc, full(release.ChannelProduction)))
+	if err := stage(alice, id); err != nil {
+		t.Fatal(err)
+	}
+	left, _ := filepath.Glob(filepath.Join(b.state, "osadmin-api", "uploads", "*"))
+	if len(left) != 0 {
+		t.Fatalf("after the stage the uploads hold %v", left)
+	}
+	if e := lastEntry(t, b.log, "upgrade.stage"); e.Detail["removed"] != "0.0.9" {
+		t.Fatalf("the stage entry %+v; want removed 0.0.9", e)
+	}
+	if e := lastEntry(t, b.log, "upgrade.remove"); e.Outcome != "ok" || e.Actor != "alice" || e.Detail["version"] != "0.0.9" || e.Detail["for"] != "0.2.0" {
+		t.Fatalf("the removal entry %+v", e)
+	}
+}
+
+func TestUpdatesNamesWhatTheNextStageRemoves(t *testing.T) {
+	b := newBox(t, false)
+	b.init.nextRemoves = []string{"0.0.9"}
+	alice := b.browser()
+	alice.signIn("alice")
+	g, err := alice.upgrade().GetUpgrades(context.Background(), connect.NewRequest(&osadminv1.GetUpgradesRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := g.Msg.GetNextStageRemoves(); len(r) != 1 || r[0] != "0.0.9" {
+		t.Fatalf("next stage removes %v; want 0.0.9", r)
+	}
+}
+
+func TestAnUnverifiedBinIsNeverUnpacked(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	other, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := bin(t, b.sign, b.enc, full(release.ChannelProduction))
+	tampered[len(tampered)-1] ^= 0xff
+	for _, tc := range []struct {
+		name, symbol string
+		body         []byte
+	}{
+		{"another signing key", "UPGRADE_SIGNATURE", bin(t, testpki.ECDSA(t), b.enc, full(release.ChannelProduction))},
+		{"a changed payload", "UPGRADE_SIGNATURE", tampered},
+		{"a lab package on a production box", "UPGRADE_CHANNEL", bin(t, testpki.ECDSA(t), other, full(release.ChannelLab))},
+		{"not a package", "UPGRADE_FORMAT", []byte("hello")},
+		{"a patch for another base", "UPGRADE_PATCH_BASE", bin(t, b.sign, b.enc, updatepkg.Header{Version: "0.1.1", Arch: "amd64", Kind: updatepkg.KindPatch, Bases: []string{"0.0.9"}, Channel: release.ChannelProduction})},
+	} {
+		id, _ := alice.upload(t, tc.body)
+		err := stage(alice, id)
+		if err == nil || !bytes.Contains([]byte(err.Error()), []byte(tc.symbol)) {
+			t.Errorf("%s: got %v", tc.name, err)
+		}
+		if b.unpacked(t) || len(b.init.staged) != 0 {
+			t.Fatalf("%s was unpacked", tc.name)
+		}
+		if err := stage(alice, id); err == nil || !bytes.Contains([]byte(err.Error()), []byte("UPGRADE_UPLOAD")) {
+			t.Errorf("%s: a refused upload is removed: %v", tc.name, err)
+		}
+	}
+	if e := lastEntry(t, b.log, "upgrade.stage"); e.Outcome != "refused" {
+		t.Fatalf("%+v", e)
+	}
+}
+
+func TestAPatchForTheRunningVersionStages(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	id, _ := alice.upload(t, bin(t, b.sign, b.enc, patchHeader("0.1.1", "0.1.0")))
+	if err := stage(alice, id); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.init.patches) != 1 || b.init.patches[0].GetBaseVersion() != "0.1.0" || b.init.patches[0].GetRootSha256() != strings.Repeat("c", 64) || b.init.patches[0].GetBaseRootSize() != 4096 {
+		t.Fatalf("init was given %v", b.init.patches)
+	}
+	// A patch without its base and target hashes can't be rebuilt.
+	id, _ = alice.upload(t, bin(t, b.sign, b.enc, updatepkg.Header{Version: "0.1.1", Arch: "amd64", Kind: updatepkg.KindPatch, Bases: []string{"0.1.0"}, Channel: release.ChannelProduction}))
+	symbolIn(t, stage(alice, id), connect.CodeFailedPrecondition, "UPGRADE_FORMAT")
+}
+
+// patchHeader is a Base OS patch from base to target, with the full
+// release it falls back to.
+func patchHeader(target, base string) updatepkg.Header {
+	return updatepkg.Header{Unit: updatepkg.UnitBaseOS, Version: target, Arch: "amd64", Kind: updatepkg.KindPatch, Bases: []string{base}, Channel: release.ChannelProduction,
+		Method: updatepkg.MethodZstdPatch, Base: &updatepkg.PatchBase{Version: base, RootSHA256: strings.Repeat("a", 64), RootSize: 4096, UKISHA256: strings.Repeat("b", 64)},
+		Target: &updatepkg.PatchTarget{Version: target, RootSHA256: strings.Repeat("c", 64), UKISHA256: strings.Repeat("d", 64), FullBin: "appliance-baseOS-" + target + "-amd64.bin"}}
+}
+
+// A fetched patch that init refuses (another base, or a rebuild that isn't
+// the target) is followed by the full release from the same mirror, with
+// an audit entry saying so; nothing is asked of the owner.
+func TestAPatchThatDoesntApplyFallsBackToTheFullRelease(t *testing.T) {
+	for _, refusal := range []string{"UPGRADE_PATCH_BASE (2508): the running root image isn't the one the patch was made from", "UPGRADE_PATCH_RESULT (2533): root.delta rebuilds to another SHA-256"} {
+		b := newBox(t, false)
+		alice := b.browser()
+		alice.signIn("alice")
+		ctx := context.Background()
+		p := patchHeader("0.1.1", "0.1.0")
+		patchName := updatepkg.FileName(p)
+		b.mirrorFiles[patchName] = bin(t, b.sign, b.enc, p)
+		f := updatepkg.Header{Unit: updatepkg.UnitBaseOS, Version: "0.1.1", Arch: "amd64", Kind: updatepkg.KindFull, Channel: release.ChannelProduction}
+		b.mirrorFiles[p.Target.FullBin] = bin(t, b.sign, b.enc, f)
+		pol := &osadminv1.UpgradePolicy{Mode: "manual", WindowStart: "02:00", WindowMinutes: 120, MirrorUrl: b.mirror.URL}
+		if _, err := alice.upgrade().SetUpgradePolicy(ctx, connect.NewRequest(&osadminv1.SetUpgradePolicyRequest{Policy: pol})); err != nil {
+			t.Fatal(err)
+		}
+		b.init.patchErr = connect.NewError(connect.CodeFailedPrecondition, errors.New(refusal))
+		got, err := alice.upgrade().FetchUpdate(ctx, connect.NewRequest(&osadminv1.FetchUpdateRequest{FileName: patchName}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := alice.upgrade().StageUpdate(ctx, connect.NewRequest(&osadminv1.StageUpdateRequest{UploadId: got.Msg.GetUploadId()}))
+		if err != nil {
+			t.Fatalf("%s: %v", refusal[:20], err)
+		}
+		if res.Msg.GetPackage().GetKind() != "full" || len(b.init.patches) != 1 || len(b.init.staged) != 1 {
+			t.Fatalf("staged %v, patches %d", res.Msg.GetPackage(), len(b.init.patches))
+		}
+		e := lastEntry(t, b.log, "upgrade.patch-fallback")
+		if e.Outcome != "ok" || e.Actor != "alice" || e.Detail["full"] != p.Target.FullBin || !strings.HasPrefix(refusal, e.Detail["reason"]) {
+			t.Fatalf("the fallback entry %+v", e)
+		}
+		if left, _ := filepath.Glob(filepath.Join(b.state, "osadmin-api", "uploads", "*.bin")); len(left) != 0 {
+			t.Fatalf("left %v", left)
+		}
+	}
+}
+
+// The fallback finds the full release through the index the box last
+// checked, never by the name it would guess: a mirror that lists the full
+// release under another name (one from before the version-only names)
+// still serves the fallback.
+func TestAPatchFallbackFetchesTheFullReleaseTheIndexNames(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	ctx := context.Background()
+	p := patchHeader("0.1.1", "0.1.0")
+	p.Name, p.Commit = updatepkg.Name, "1a2b3c4"
+	f := updatepkg.Header{Name: updatepkg.Name, Unit: updatepkg.UnitBaseOS, Version: "0.1.1", Commit: "1a2b3c4", Arch: "amd64", Kind: updatepkg.KindFull, Channel: release.ChannelProduction}
+	listed := updatepkg.PreviousFileName(f)
+	if listed == p.Target.FullBin {
+		t.Fatal("the test needs the index to name the full release differently")
+	}
+	var idx updatepkg.Index
+	if err := idx.AddFile(p, 1<<20, updatepkg.FileName(p)); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.AddFile(f, 33<<20, listed); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.mirrorFiles[updatepkg.IndexName] = raw
+	b.mirrorFiles[updatepkg.FileName(p)] = bin(t, b.sign, b.enc, p)
+	b.mirrorFiles[listed] = bin(t, b.sign, b.enc, f)
+	if err := setPolicy(t, alice, &osadminv1.UpgradePolicy{Source: osadmin.SourceManual, MirrorUrl: b.mirror.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkNow(alice); err != nil {
+		t.Fatal(err)
+	}
+	b.init.patchErr = connect.NewError(connect.CodeFailedPrecondition, errors.New("UPGRADE_PATCH_BASE (2508): the running root image isn't the one the patch was made from"))
+	got, err := alice.upgrade().FetchUpdate(ctx, connect.NewRequest(&osadminv1.FetchUpdateRequest{FileName: updatepkg.FileName(p)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := alice.upgrade().StageUpdate(ctx, connect.NewRequest(&osadminv1.StageUpdateRequest{UploadId: got.Msg.GetUploadId()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Msg.GetPackage().GetKind() != "full" {
+		t.Fatalf("staged %v", res.Msg.GetPackage())
+	}
+	if e := lastEntry(t, b.log, "upgrade.patch-fallback"); e.Outcome != "ok" || e.Detail["full"] != listed {
+		t.Fatalf("the fallback entry %+v", e)
+	}
+}
+
+// An uploaded patch that doesn't apply isn't followed by a fetch: the
+// refusal names the full release to upload.
+func TestAnUploadedPatchThatDoesntApplyNamesTheFullRelease(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	b.init.patchErr = connect.NewError(connect.CodeFailedPrecondition, errors.New("UPGRADE_PATCH_BASE (2508): the running UKI isn't the one the patch was made from"))
+	p := patchHeader("0.1.1", "0.1.0")
+	id, _ := alice.upload(t, bin(t, b.sign, b.enc, p))
+	err := stage(alice, id)
+	symbolIn(t, err, connect.CodeFailedPrecondition, "UPGRADE_PATCH_BASE")
+	if !strings.Contains(err.Error(), p.Target.FullBin) || b.mirrorHit != 0 {
+		t.Fatalf("%v (mirror hits %d)", err, b.mirrorHit)
+	}
+}
+
+func TestUploadNeedsCSRF(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	alice.csrf = ""
+	if _, code := alice.upload(t, []byte("x")); code != http.StatusForbidden {
+		t.Fatalf("got %d", code)
+	}
+	if _, code := b.browser().upload(t, []byte("x")); code != http.StatusForbidden {
+		t.Fatalf("no session: %d", code)
+	}
+}
+
+func TestAirGapMeansNoFetch(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	ctx := context.Background()
+	name := "appliance-0.2.0-amd64.bin"
+	b.mirrorFiles[name] = bin(t, b.sign, b.enc, full(release.ChannelProduction))
+	_, err := alice.upgrade().FetchUpdate(ctx, connect.NewRequest(&osadminv1.FetchUpdateRequest{FileName: name}))
+	symbolIn(t, err, connect.CodeFailedPrecondition, "UPGRADE_AIR_GAPPED")
+	if b.mirrorHit != 0 {
+		t.Fatal("an air-gapped box made a network fetch")
+	}
+
+	pol := &osadminv1.UpgradePolicy{Mode: "manual", WindowStart: "02:00", WindowMinutes: 120, MirrorUrl: "ftp://mirror.appliance.example.org"}
+	_, err = alice.upgrade().SetUpgradePolicy(ctx, connect.NewRequest(&osadminv1.SetUpgradePolicyRequest{Policy: pol}))
+	symbolIn(t, err, connect.CodeInvalidArgument, "ACCESS_CONFIRM")
+	pol.MirrorUrl = b.mirror.URL + "/"
+	if _, err := alice.upgrade().SetUpgradePolicy(ctx, connect.NewRequest(&osadminv1.SetUpgradePolicyRequest{Policy: pol})); err != nil {
+		t.Fatal(err)
+	}
+	_, err = alice.upgrade().FetchUpdate(ctx, connect.NewRequest(&osadminv1.FetchUpdateRequest{FileName: "../etc/passwd"}))
+	symbolIn(t, err, connect.CodeFailedPrecondition, "UPGRADE_UPLOAD")
+	f, err := alice.upgrade().FetchUpdate(ctx, connect.NewRequest(&osadminv1.FetchUpdateRequest{FileName: name}))
+	if err != nil || b.mirrorHit != 1 {
+		t.Fatalf("%v %v", f, err)
+	}
+	if err := stage(alice, f.Msg.GetUploadId()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = alice.upgrade().FetchUpdate(ctx, connect.NewRequest(&osadminv1.FetchUpdateRequest{FileName: "appliance-9.9.9-amd64.bin"}))
+	symbolIn(t, err, connect.CodeFailedPrecondition, "UPGRADE_UPLOAD")
+}
+
+func TestApplyAndRevert(t *testing.T) {
+	b := newBox(t, true)
+	alice := b.browser()
+	alice.signIn("alice")
+	ctx := context.Background()
+	_, err := alice.upgrade().ApplyUpdate(ctx, connect.NewRequest(&osadminv1.ApplyUpdateRequest{TotpCode: b.code("alice")}))
+	symbolIn(t, err, connect.CodeFailedPrecondition, "UPGRADE_NOT_STAGED")
+	id, _ := alice.upload(t, bin(t, b.sign, b.enc, full(release.ChannelProduction)))
+	if err := stage(alice, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := alice.upgrade().ApplyUpdate(ctx, connect.NewRequest(&osadminv1.ApplyUpdateRequest{TotpCode: b.code("alice")})); err != nil {
+		t.Fatal(err)
+	}
+	if b.init.activated != 1 || b.init.reboots != 1 {
+		t.Fatal("apply activates and reboots")
+	}
+	if _, err := alice.upgrade().RevertUpdate(ctx, connect.NewRequest(&osadminv1.RevertUpdateRequest{TotpCode: b.code("alice")})); err != nil {
+		t.Fatal(err)
+	}
+	if b.init.rollbacks != 1 || b.init.reboots != 2 {
+		t.Fatal("revert rolls back and reboots")
+	}
+	bob := b.browser()
+	bob.signIn("bob")
+	_, err = bob.upgrade().ApplyUpdate(ctx, connect.NewRequest(&osadminv1.ApplyUpdateRequest{TotpCode: b.code("bob")}))
+	symbolIn(t, err, connect.CodePermissionDenied, "ACCESS_FORBIDDEN")
+}
+
+func TestTheWindowAppliesOnce(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	ctx := context.Background()
+	open := b.clk.Now().Local().Add(-10 * time.Minute).Format("15:04")
+	pol := &osadminv1.UpgradePolicy{Mode: "manual", WindowStart: open, WindowMinutes: 60}
+	if _, err := alice.upgrade().SetUpgradePolicy(ctx, connect.NewRequest(&osadminv1.SetUpgradePolicyRequest{Policy: pol})); err != nil {
+		t.Fatal(err)
+	}
+	b.srv.UpgradeWindowTick(ctx)
+	if b.init.activated != 0 {
+		t.Fatal("nothing staged")
+	}
+	id, _ := alice.upload(t, bin(t, b.sign, b.enc, full(release.ChannelProduction)))
+	if err := stage(alice, id); err != nil {
+		t.Fatal(err)
+	}
+	b.srv.UpgradeWindowTick(ctx)
+	if b.init.activated != 0 {
+		t.Fatal("manual mode never applies in the window")
+	}
+	pol.Mode = "automatic"
+	if _, err := alice.upgrade().SetUpgradePolicy(ctx, connect.NewRequest(&osadminv1.SetUpgradePolicyRequest{Policy: pol})); err != nil {
+		t.Fatal(err)
+	}
+	b.srv.UpgradeWindowTick(ctx)
+	b.srv.UpgradeWindowTick(ctx)
+	if b.init.activated != 1 {
+		t.Fatalf("applied %d times", b.init.activated)
+	}
+	if e := lastEntry(t, b.log, "upgrade.apply"); e.Actor != "window" || e.Outcome != "ok" {
+		t.Fatalf("%+v", e)
+	}
+}
+
+func TestTheBootedReleaseIsMarkedGoodOnceTheBoxIsHealthy(t *testing.T) {
+	b := newBox(t, false)
+	ctx := context.Background()
+	if err := b.srv.MarkGood(ctx); err == nil || b.init.markedGood != 0 {
+		t.Fatalf("before setup is done: %v, marked %d", err, b.init.markedGood)
+	}
+	if err := os.MkdirAll(filepath.Join(b.state, "setup"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.state, "setup", osadmin.DoneMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b.netd.down = true
+	if err := b.srv.MarkGood(ctx); err == nil || b.init.markedGood != 0 {
+		t.Fatalf("with netd down: %v, marked %d", err, b.init.markedGood)
+	}
+	b.netd.down = false
+	if err := b.srv.MarkGood(ctx); err != nil || b.init.markedGood != 1 {
+		t.Fatalf("healthy: %v, marked %d", err, b.init.markedGood)
+	}
+}
+
+func TestMarkGoodWaitsOutAnApplyOrRevert(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	ctx := context.Background()
+	if err := os.MkdirAll(filepath.Join(b.state, "setup"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.state, "setup", osadmin.DoneMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A revert marks the running release bad and reboots; marking it good
+	// before the reboot would undo the revert.
+	if _, err := alice.upgrade().RevertUpdate(ctx, connect.NewRequest(&osadminv1.RevertUpdateRequest{TotpCode: b.code("alice")})); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.srv.MarkGood(ctx); err == nil || b.init.markedGood != 0 {
+		t.Fatalf("during a revert: %v, marked %d", err, b.init.markedGood)
+	}
+}
+
+// Apply and Revert take a fresh authenticator code on every call: a
+// step-up window that is still open isn't enough, and a stale one doesn't
+// stop a call that carries a good code.
+func TestApplyAndRevertTakeAFreshCodeEveryTime(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	ctx := context.Background()
+	id, _ := alice.upload(t, bin(t, b.sign, b.enc, full(release.ChannelProduction)))
+	if err := stage(alice, id); err != nil {
+		t.Fatal(err)
+	}
+	_, err := alice.upgrade().ApplyUpdate(ctx, connect.NewRequest(&osadminv1.ApplyUpdateRequest{}))
+	symbolIn(t, err, connect.CodeInvalidArgument, "ACCESS_CONFIRM")
+	_, err = alice.upgrade().ApplyUpdate(ctx, connect.NewRequest(&osadminv1.ApplyUpdateRequest{TotpCode: "000000"}))
+	symbolIn(t, err, connect.CodeUnauthenticated, "ACCESS_CREDENTIALS")
+	if b.init.activated != 0 || b.init.reboots != 0 {
+		t.Fatal("a refused apply changed nothing")
+	}
+	if e := lastEntry(t, b.log, "upgrade.apply"); e.Outcome != "refused" || e.Actor != "alice" {
+		t.Fatalf("%+v", e)
+	}
+	b.clk.Advance(10 * time.Minute)
+	if _, err := alice.upgrade().ApplyUpdate(ctx, connect.NewRequest(&osadminv1.ApplyUpdateRequest{TotpCode: b.code("alice")})); err != nil {
+		t.Fatal(err)
+	}
+	if b.init.activated != 1 || b.init.reboots != 1 {
+		t.Fatal("apply with a fresh code activates and reboots")
+	}
+	_, err = alice.upgrade().RevertUpdate(ctx, connect.NewRequest(&osadminv1.RevertUpdateRequest{}))
+	symbolIn(t, err, connect.CodeInvalidArgument, "ACCESS_CONFIRM")
+	if _, err := alice.upgrade().RevertUpdate(ctx, connect.NewRequest(&osadminv1.RevertUpdateRequest{TotpCode: b.code("alice")})); err != nil {
+		t.Fatal(err)
+	}
+	if b.init.rollbacks != 1 || b.init.reboots != 2 {
+		t.Fatal("revert with a fresh code rolls back and reboots")
+	}
+}
+
+// A manual revert is reported as reverted, by whom and when, never as a
+// failed boot.
+func TestARevertIsReportedAsReverted(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	ctx := context.Background()
+	if _, err := alice.upgrade().RevertUpdate(ctx, connect.NewRequest(&osadminv1.RevertUpdateRequest{TotpCode: b.code("alice")})); err != nil {
+		t.Fatal(err)
+	}
+	if b.init.revertedBy != "alice" {
+		t.Fatalf("init was told %q asked for the revert", b.init.revertedBy)
+	}
+	g, err := alice.upgrade().GetUpgrades(ctx, connect.NewRequest(&osadminv1.GetUpgradesRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := g.Msg; m.GetFailedVersion() != "" || m.GetRevertedVersion() != "0.2.0" || m.GetRevertedBy() != "alice" || m.GetRevertedAt() == nil {
+		t.Fatalf("upgrades %+v", m)
+	}
+	st, err := osadminv1connect.NewStatusServiceClient(alice.hc, b.ts.URL).GetStatus(ctx, connect.NewRequest(&osadminv1.GetStatusRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := st.Msg; m.GetFailedVersion() != "" || m.GetRevertedVersion() != "0.2.0" || m.GetRevertedBy() != "alice" || m.GetRevertedAt() == nil {
+		t.Fatalf("status %+v", m)
+	}
+}
+
+// A staged base release names the slot it went into: the one the box
+// isn't running from.
+func TestStagingNamesTheOtherSlot(t *testing.T) {
+	for running, want := range map[string]string{switchroot.LabelRootA: "B", switchroot.LabelRootB: "A", "": ""} {
+		b := newBox(t, false, func(_ *box, o *osadmin.Options) { o.RootSource = running })
+		alice := b.browser()
+		alice.signIn("alice")
+		id, _ := alice.upload(t, bin(t, b.sign, b.enc, full(release.ChannelProduction)))
+		out, err := alice.upgrade().StageUpdate(context.Background(), connect.NewRequest(&osadminv1.StageUpdateRequest{UploadId: id}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := out.Msg.GetSlot(); got != want {
+			t.Errorf("running from %q: staged into %q, want %q", running, got, want)
+		}
+	}
+}
+
+// The release kept for a revert is reported with the slot it's in, on
+// Status and Updates; with none there's no slot either.
+func TestThePreviousReleaseIsReportedWithItsSlot(t *testing.T) {
+	for running, want := range map[string]string{switchroot.LabelRootA: "B", switchroot.LabelRootB: "A"} {
+		b := newBox(t, false, func(_ *box, o *osadmin.Options) { o.RootSource = running })
+		alice := b.browser()
+		alice.signIn("alice")
+		ctx := context.Background()
+		status := func() *osadminv1.GetStatusResponse {
+			st, err := osadminv1connect.NewStatusServiceClient(alice.hc, b.ts.URL).GetStatus(ctx, connect.NewRequest(&osadminv1.GetStatusRequest{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return st.Msg
+		}
+		upgrades := func() *osadminv1.GetUpgradesResponse {
+			g, err := alice.upgrade().GetUpgrades(ctx, connect.NewRequest(&osadminv1.GetUpgradesRequest{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return g.Msg
+		}
+		if m := status(); m.GetPreviousVersion() != "" || m.GetPreviousSlot() != "" {
+			t.Fatalf("running from %s with no previous release: status %+v", running, m)
+		}
+		if m := upgrades(); m.GetPreviousVersion() != "" || m.GetPreviousSlot() != "" {
+			t.Fatalf("running from %s with no previous release: upgrades %+v", running, m)
+		}
+		b.init.mu.Lock()
+		b.init.previousVer = "0.0.9"
+		b.init.mu.Unlock()
+		if m := status(); m.GetPreviousVersion() != "0.0.9" || m.GetPreviousSlot() != want {
+			t.Fatalf("running from %s: status %+v", running, m)
+		}
+		if m := upgrades(); m.GetPreviousVersion() != "0.0.9" || m.GetPreviousSlot() != want {
+			t.Fatalf("running from %s: upgrades %+v", running, m)
+		}
+	}
+}
+
+// The SHA-256 a stage shows is the file's own, the value sha256sum gives
+// for the .bin the admin holds, not the digest of the payload inside it.
+func TestAStagedFileShowsItsOwnSHA256(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	body := bin(t, b.sign, b.enc, full(release.ChannelProduction))
+	id, _ := alice.upload(t, body)
+	res, err := alice.upgrade().StageUpdate(context.Background(), connect.NewRequest(&osadminv1.StageUpdateRequest{UploadId: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	if got, want := res.Msg.GetPackage().GetSha256(), hex.EncodeToString(sum[:]); got != want {
+		t.Fatalf("stage shows %s, the file's sha256sum is %s", got, want)
+	}
+}
+
+// A staged Base OS says which Base Web it ships with, in the stage's
+// answer and in GetUpgrades until it's applied.
+func TestAStagedBaseOSNamesItsBaseWeb(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	h := full(release.ChannelProduction)
+	h.Unit, h.Includes = updatepkg.UnitBaseOS, map[updatepkg.Unit]string{updatepkg.UnitBaseWeb: "0.2.0"}
+	id, _ := alice.upload(t, bin(t, b.sign, b.enc, h))
+	res, err := alice.upgrade().StageUpdate(context.Background(), connect.NewRequest(&osadminv1.StageUpdateRequest{UploadId: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Msg.GetPackage().GetIncludesBaseWeb() != "0.2.0" {
+		t.Fatalf("stage answer %v", res.Msg.GetPackage())
+	}
+	g, err := alice.upgrade().GetUpgrades(context.Background(), connect.NewRequest(&osadminv1.GetUpgradesRequest{}))
+	if err != nil || g.Msg.GetStagedVersion() != "0.2.0" || g.Msg.GetStagedIncludesBaseWeb() != "0.2.0" {
+		t.Fatalf("GetUpgrades %v %v", g.Msg, err)
+	}
+}

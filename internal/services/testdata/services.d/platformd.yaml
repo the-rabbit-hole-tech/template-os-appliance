@@ -1,0 +1,4 @@
+exec: /usr/libexec/appliance/platformd
+phases: [firstboot, normal]
+readiness:
+  file: /run/appliance/platformd.ready

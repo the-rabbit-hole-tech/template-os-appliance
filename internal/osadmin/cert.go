@@ -1,0 +1,184 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osadmin
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	log "github.com/Bugs5382/go-log"
+	"golang.org/x/sys/unix"
+
+	"example.org/appliance/internal/certstore"
+)
+
+// The certificate files in Paths.OwnDir.
+const (
+	certFile = "tls.crt"
+	keyFile  = "tls.key"
+)
+
+// CertInfo describes :8443's certificate for Status.
+type CertInfo struct {
+	Fingerprint string
+	Expires     time.Time
+	// SelfSigned is the box's own certificate: no store certificate is
+	// assigned to :8443.
+	SelfSigned bool
+}
+
+// ServeCert is what appliance-osadmin serves at start: the certificate in
+// dir, whatever it names, and a new one only when nothing there loads.
+// Whether it still fits the box is accessd's call (Server.FollowCerts),
+// because only accessd knows that a change of address is kept.
+func ServeCert(dir, hostname string, addrs []string, now time.Time) (tls.Certificate, CertInfo, error) {
+	if c, info, err := loadCert(dir); err == nil {
+		return c, info, nil
+	}
+	return EnsureCert(dir, hostname, addrs, now)
+}
+
+// EnsureCert loads :8443's certificate from dir. While a store certificate
+// is assigned (certstore.AssignedMarker) it is served as it is. Otherwise
+// the box's own self-signed ECDSA P-256 one is kept, or made new when
+// there is none, or certstore.WhyReplace says it can't stay. A certificate
+// that names more addresses than addrs is kept. The key never leaves dir.
+func EnsureCert(dir, hostname string, addrs []string, now time.Time) (tls.Certificate, CertInfo, error) {
+	if certstore.AssignedID(dir) != "" {
+		if c, info, err := loadCert(dir); err == nil {
+			return c, info, nil
+		}
+		// An assigned certificate that doesn't load falls back to a new
+		// self-signed one, and the marker goes so the store sees it.
+		if err := os.Remove(filepath.Join(dir, certstore.AssignedMarker)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return tls.Certificate{}, CertInfo{}, fmt.Errorf("tls: %w", err)
+		}
+	}
+	if c, info, err := loadCert(dir); err == nil {
+		if certstore.WhyReplace(c.Leaf, hostname, addrs, now) == "" {
+			return c, info, nil
+		}
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return tls.Certificate{}, CertInfo{}, fmt.Errorf("tls: %w", err)
+	}
+	crt, key, err := certstore.NewSelfSigned(hostname, addrs, now)
+	if err != nil {
+		return tls.Certificate{}, CertInfo{}, err
+	}
+	if err := writeAtomic(filepath.Join(dir, keyFile), key); err != nil {
+		return tls.Certificate{}, CertInfo{}, err
+	}
+	if err := writeAtomic(filepath.Join(dir, certFile), crt); err != nil {
+		return tls.Certificate{}, CertInfo{}, err
+	}
+	return loadCert(dir)
+}
+
+func loadCert(dir string) (tls.Certificate, CertInfo, error) {
+	c, err := tls.LoadX509KeyPair(filepath.Join(dir, certFile), filepath.Join(dir, keyFile))
+	if err != nil {
+		return tls.Certificate{}, CertInfo{}, fmt.Errorf("tls: %w", err)
+	}
+	leaf, err := x509.ParseCertificate(c.Certificate[0])
+	if err != nil {
+		return tls.Certificate{}, CertInfo{}, fmt.Errorf("tls: %w", err)
+	}
+	c.Leaf = leaf
+	return c, CertInfo{Fingerprint: Fingerprint(leaf.Raw), Expires: leaf.NotAfter, SelfSigned: certstore.AssignedID(dir) == ""}, nil
+}
+
+// ReadCertInfo describes the certificate in dir without reading its key.
+// The directory is appliance-osadmin's, so a link there isn't followed.
+func ReadCertInfo(dir string) (CertInfo, error) {
+	f, err := os.OpenFile(filepath.Join(dir, certFile), os.O_RDONLY|unix.O_NOFOLLOW, 0) // #nosec G304 -- the certificate under osadmin's own directory, links refused
+	if err != nil {
+		return CertInfo{}, fmt.Errorf("tls: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, 64<<10))
+	if err != nil {
+		return CertInfo{}, fmt.Errorf("tls: %w", err)
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil || blk.Type != "CERTIFICATE" {
+		return CertInfo{}, fmt.Errorf("tls: %s holds no certificate", certFile)
+	}
+	leaf, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		return CertInfo{}, fmt.Errorf("tls: %w", err)
+	}
+	return CertInfo{Fingerprint: Fingerprint(leaf.Raw), Expires: leaf.NotAfter, SelfSigned: certstore.AssignedID(dir) == ""}, nil
+}
+
+// Fingerprint is a certificate's SHA-256 as colon-separated hex, the form
+// the console shows for checking on first visit.
+func Fingerprint(der []byte) string { return certstore.Fingerprint(der) }
+
+// CertSource serves :8443's certificate and re-reads it when accessd
+// swaps the files, so a new certificate needs no restart. A pair that
+// doesn't load (the key written, the certificate not yet) keeps the last
+// good one until the next handshake.
+type CertSource struct {
+	dir    string
+	logger log.Logger
+	mu     sync.Mutex
+	cur    *tls.Certificate
+	stamp  string
+}
+
+// NewCertSource starts from c, the certificate EnsureCert loaded from dir.
+func NewCertSource(dir string, c tls.Certificate, lg log.Logger) *CertSource {
+	if lg == nil {
+		lg = log.Nop()
+	}
+	src := &CertSource{dir: dir, logger: lg, cur: &c}
+	src.stamp = src.stat()
+	return src
+}
+
+// GetCertificate is the tls.Config callback.
+func (c *CertSource) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st := c.stat(); st != c.stamp {
+		next, info, err := loadCert(c.dir)
+		if err != nil {
+			c.logger.Warn("osadmin: the new :8443 certificate doesn't load yet; serving the previous one", log.F("error", err.Error()))
+			return c.cur, nil
+		}
+		c.cur, c.stamp = &next, st
+		c.logger.Info("osadmin: :8443 certificate reloaded", log.F("fingerprint", info.Fingerprint), log.F("expires", info.Expires), log.F("selfSigned", info.SelfSigned))
+	}
+	return c.cur, nil
+}
+
+// stat identifies the current files: a swap renames new files in, so the
+// inode changes.
+func (c *CertSource) stat() string {
+	var b strings.Builder
+	for _, name := range []string{certFile, keyFile} {
+		fi, err := os.Lstat(filepath.Join(c.dir, name))
+		if err != nil {
+			b.WriteString("-;")
+			continue
+		}
+		ino := uint64(0)
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			ino = st.Ino
+		}
+		fmt.Fprintf(&b, "%d:%d:%d;", ino, fi.Size(), fi.ModTime().UnixNano())
+	}
+	return b.String()
+}
