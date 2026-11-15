@@ -1,0 +1,35 @@
+# A minimal import Job template for internal/productimport's tests
+# (docs/import.md): a real product's own template carries its own image,
+# environment and volumes; this fixture only exercises the placeholders
+# the box fills, per step: ${JOB_NAME} the step's Job name, ${ARGS} the
+# migrate command and its flags (a JSON list), ${HOST_DIR} the import
+# directory on the state volume.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: app
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: "@MIGRATE_IMAGE@"
+          args: ${ARGS}
+          resources:
+            requests:
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+          env:
+            - name: MIGRATE_OUTPUT_FILE
+              value: /import/out/${JOB_NAME}.txt
+            - name: MIGRATE_OWNER_PASSWORD_FILE
+              value: /import/out/${JOB_NAME}.owner
+      volumes:
+        - name: import
+          hostPath:
+            path: ${HOST_DIR}
+            type: Directory
