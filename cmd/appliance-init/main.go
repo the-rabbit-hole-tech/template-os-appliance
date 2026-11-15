@@ -1,0 +1,350 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build linux
+
+// Command appliance-init is PID 1 on the appliance: it mounts the early
+// filesystems, reaps every child, decides the boot phase, runs the enrol
+// phase, finishes an interrupted factory reset, supervises the service
+// table, and serves init.sock and power.sock (reboot, shutdown and the
+// factory reset).
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+	// The root has no zoneinfo; the box's time zone setting is read from
+	// the copy linked in.
+	_ "time/tzdata"
+
+	log "github.com/Bugs5382/go-log"
+	"golang.org/x/sys/unix"
+
+	"example.org/appliance/internal/codes"
+	"example.org/appliance/internal/console"
+	"example.org/appliance/internal/consoleui/screens"
+	"example.org/appliance/internal/initapi"
+	"example.org/appliance/internal/keycustody"
+	"example.org/appliance/internal/osaudit"
+	"example.org/appliance/internal/phase"
+	"example.org/appliance/internal/reaper"
+	"example.org/appliance/internal/release"
+	"example.org/appliance/internal/secureboot"
+	"example.org/appliance/internal/services"
+	"example.org/appliance/internal/switchroot"
+	"example.org/appliance/internal/vports"
+)
+
+// Paths on the box.
+const (
+	espMount  = "/run/appliance/esp"
+	setupDone = "/var/lib/appliance/setup/done"
+	// consoleLog holds the shared output while a program owns the
+	// consoles; the console's Recent messages screen reads it.
+	consoleLog    = "/run/appliance/console.log"
+	consoleLogMax = 1 << 20
+)
+
+func main() {
+	lg := log.NewLoggerWithOptions("appliance-init", log.WithOutput(os.Stderr), log.WithDefaultFormat(log.FormatConsole), log.WithDefaultLevel(log.LevelInfo))
+	if os.Getpid() != 1 {
+		lg.Error(nil, "appliance-init must run as PID 1")
+		os.Exit(1)
+	}
+	mountEarly(lg)
+	if err := quietKernel(printkPath); err != nil {
+		lg.Warn("init: the kernel's console loglevel wasn't set", log.F("error", err.Error()))
+	}
+	con := takeConsole(lg)
+	if con != nil {
+		// While the screen shows the starting page, or the dashboard or the
+		// setup wizard owns the consoles, the services' and init's own
+		// lines go to a file in /run instead of over the screen.
+		con.SetAside(&console.LogFile{Path: consoleLog, Max: consoleLogMax})
+	}
+	screen := newBootScreen(con)
+	screen.starting()
+	if err := run(lg, con, screen); err != nil {
+		lg.Error(err, "init: fatal")
+		screen.loud()
+		_, _ = fmt.Fprintln(os.Stderr, "appliance-init:", codes.Describe(err))
+	}
+	// PID 1 must never exit: halt here so the console keeps the error.
+	select {}
+}
+
+// flushWait is how long a reboot waits for the last lines to reach every
+// console.
+const flushWait = 2 * time.Second
+
+func run(lg log.TraceLogger, con *console.Taken, screen bootScreen) error {
+	r := reaper.NewReaper()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	pins, perr := release.Load()
+	if perr != nil {
+		lg.Error(perr, "init: this build carries no pins; Secure Boot can't be checked as org-only")
+	}
+	espOK := mountESP(lg)
+	f := phase.Facts{BootedFromISO: os.Getenv(switchroot.SourceEnv) == switchroot.SourceInstall}
+	var vars secureboot.Vars
+	if e := (secureboot.Efivarfs{Dir: secureboot.DefaultEfivarfs}); e.Present() {
+		vars = e
+	}
+	var pp *release.Pins
+	if perr == nil {
+		pp = &pins
+	}
+	st, err := secureboot.Read(vars, pp)
+	if err != nil {
+		lg.Error(err, "init: Secure Boot state unknown")
+	}
+	f.SBSupported, f.SBEnforcing, f.SBEnforcingOrgOnly = st.Supported, st.Enforcing, st.Enforcing && st.OrgOnly
+	if espOK {
+		if c, err := secureboot.ReadChoice(espMount); err == nil {
+			f.SBChoice = phase.SB(c)
+		}
+	}
+	f.ResetPending = readReset(espOK, lg)
+
+	// The custody header fixes the Secure Boot choice once first boot has
+	// run; the state it unlocks holds setup/done.
+	var kc *keycustody.Custody
+	state := stateDeps{sb: st, in: os.Stdin, out: &asking{w: os.Stderr, loud: screen.loud}, logf: func(format string, a ...any) { lg.Info(fmt.Sprintf(format, a...)) }}
+	initialized, opened := false, false
+	if !f.BootedFromISO && !f.ResetPending {
+		dev := bootDisk()
+		if dev == "" {
+			return errors.New("init: the boot disk (the one with the ESP) wasn't found, so the state can't be opened")
+		}
+		kc, state.hasTPM = newCustody(dev, espOK, lg)
+		state.custody = kc
+		h, ok, err := readHeader(ctx, kc)
+		if err != nil {
+			screen.loud()
+			_, _ = fmt.Fprint(os.Stderr, screens.StateLocked(codes.Describe(err)))
+			return err
+		}
+		if initialized = ok; ok {
+			f.SBChoice, f.SBChoiceFixed, f.SBEnrolPending = phase.SB(h.SecureBoot), true, h.EnrolPending
+		}
+	}
+	state.choice = f.SBChoice
+	p := phase.Decide(f)
+	if p == phase.Firstboot && initialized {
+		if err := openState(ctx, state, true); err != nil {
+			return err
+		}
+		opened = true
+		if _, err := os.Stat(setupDone); err == nil {
+			f.SetupDone = true
+			p = phase.Decide(f)
+		}
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "appliance-init: phase=%s protection=%s\n", p, protection(st, f))
+	lg.Info("init: phase decided", log.F("phase", string(p)), log.F("secure_boot", st.Enforcing), log.F("setup_mode", st.SetupMode))
+
+	switch p {
+	case phase.Reset:
+		return finishReset(ctx, lg, con, screen)
+	case phase.Mismatch:
+		screen.loud()
+		_, _ = fmt.Fprint(os.Stderr, screens.Mismatch)
+		<-ctx.Done()
+		return nil
+	case phase.Enrol:
+		out, err := runEnrol(enrolDeps{
+			vars:      vars,
+			material:  func() (secureboot.Material, error) { return secureboot.LoadMaterial(os.DirFS(espMount)) },
+			choice:    string(f.SBChoice),
+			setChoice: func(c string) error { return secureboot.WriteChoice(espMount, c) },
+			platform:  screens.DetectPlatform(readFile("/sys/class/dmi/id/sys_vendor")),
+			in:        os.Stdin,
+			out:       &asking{w: os.Stderr, loud: screen.loud},
+			logf:      func(format string, a ...any) { lg.Info(fmt.Sprintf(format, a...)) },
+		})
+		if err != nil {
+			return err
+		}
+		if out == enrolReboot {
+			if screens.DetectPlatform(readFile("/sys/class/dmi/id/sys_vendor")) == screens.QEMU {
+				screen.stopping(osaudit.ActionReboot)
+				con.Flush(flushWait)
+				unix.Sync()
+				return unix.Reboot(unix.LINUX_REBOOT_CMD_RESTART)
+			}
+			<-ctx.Done()
+			return nil
+		}
+		p = phase.Firstboot
+		if c, err := secureboot.ReadChoice(espMount); err == nil && !f.SBChoiceFixed {
+			state.choice = phase.SB(c)
+		}
+	}
+	if p == phase.Firstboot && !opened {
+		if err := openState(ctx, state, initialized); err != nil {
+			return err
+		}
+		opened = true
+		if _, err := os.Stat(setupDone); err == nil {
+			p = phase.Normal
+		}
+	}
+	// Back to the starting page if one of init's own screens asked.
+	screen.starting()
+	if opened {
+		if host, err := bootHostname(stateRoot); err != nil {
+			lg.Error(err, "init: the box has no name of its own; the host name waits for netd")
+		} else if err := unix.Sethostname([]byte(host)); err != nil {
+			lg.Error(err, "init: the host name wasn't set", log.F("hostname", host))
+		} else {
+			lg.Info("init: host name set", log.F("hostname", host))
+		}
+		if err := recordBoxVersions(stateRoot, release.Version); err != nil {
+			lg.Error(err, "init: the box's versions weren't recorded for the product")
+		} else {
+			lg.Info("init: the box's versions are recorded for the product", log.F("baseOS", release.Version))
+		}
+	}
+
+	// The guest agent's service waits for its port's link (spec 1
+	// Section 2.8).
+	go vports.Watch(ctx, lg)
+	tbl, err := services.Load(os.DirFS("/"), services.Dir)
+	if err != nil {
+		return err
+	}
+	sopt := services.Options{Logger: lg}
+	if con != nil {
+		sopt.Console = con
+	}
+	sup := services.NewSupervisor(r, tbl, sopt)
+	pw := newPower(sup, lg, con, screen)
+	api := initapi.Options{Supervisor: sup, Power: pw, AdminName: adminName, SecureBoot: st, Logger: lg}
+	if opened {
+		api.KeyCustody = kc
+		if espOK && perr == nil {
+			if im, err := newImages(pins, kc, lg); err != nil {
+				lg.Error(err, "init: ImageService unavailable; updates can't be staged")
+			} else {
+				api.Images = im
+			}
+		}
+	}
+	srv, err := initapi.Listen(initapi.SocketPath, api)
+	if err != nil {
+		return err
+	}
+	defer srv.Stop()
+	psrv, err := initapi.ListenPower(initapi.PowerSocketPath, api)
+	if err != nil {
+		return err
+	}
+	defer psrv.Stop()
+	if err := sup.EnterPhase(ctx, p); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	lg.Info("init: shutting down")
+	_ = sup.EnterPhase(context.Background(), "")
+	unix.Sync()
+	return nil
+}
+
+func protection(st secureboot.State, f phase.Facts) string {
+	if st.Enforcing && st.OrgOnly {
+		return "full"
+	}
+	if !st.Supported {
+		return "reduced (no Secure Boot firmware)"
+	}
+	if f.SBChoice == phase.SBOff {
+		return "reduced (Secure Boot off)"
+	}
+	return "pending"
+}
+
+// takeConsole joins init's standard input, output and error to every
+// active console, so the banner and the Secure Boot screen show on the
+// screen and on the serial line, and either can answer. When none takes
+// writes, init keeps the console the kernel gave it.
+func takeConsole(lg log.Logger) *console.Taken {
+	con, dropped, err := console.Take(func(format string, a ...any) { lg.Warn(fmt.Sprintf(format, a...)) })
+	for name, why := range dropped {
+		lg.Info("init: console left out", log.F("console", name), log.F("reason", why.Error()))
+	}
+	if err != nil {
+		lg.Warn("init: keeping the kernel's console", log.F("error", err.Error()))
+		return nil
+	}
+	lg.Info("init: console", log.F("consoles", strings.Join(con.Kept, " ")))
+	return con
+}
+
+// earlyMounts are what every later step needs. nosuid and nodev are mount
+// flags, never filesystem data: tmpfs refuses an option it doesn't know
+// with EINVAL.
+var earlyMounts = []struct {
+	src, dst, fstype, data string
+	flags                  uintptr
+}{
+	{"proc", "/proc", "proc", "", nosuidNodev},
+	{"sysfs", "/sys", "sysfs", "", nosuidNodev},
+	{"devtmpfs", "/dev", "devtmpfs", "mode=0755", nosuidNodev},
+	// The kernel finds the terminals of /dev/ptmx on the devpts at
+	// /dev/pts; without it sshd gets no PTY. Not nodev: its entries are
+	// the terminals. No image group is named tty, so sshd hands each
+	// terminal to its user, mode 0600.
+	{"devpts", "/dev/pts", "devpts", "mode=0620,ptmxmode=0666", unix.MS_NOSUID | unix.MS_NOEXEC},
+	{"tmpfs", "/run", "tmpfs", "mode=0755", nosuidNodev},
+	{"tmpfs", "/tmp", "tmpfs", "mode=1777", nosuidNodev},
+	{"efivarfs", secureboot.DefaultEfivarfs, "efivarfs", "", nosuidNodev},
+}
+
+const nosuidNodev = unix.MS_NOSUID | unix.MS_NODEV
+
+// mountEarly mounts earlyMounts. Errors are logged, not fatal: a missing
+// efivarfs, for instance, just means no Secure Boot.
+func mountEarly(lg log.Logger) {
+	for _, m := range earlyMounts {
+		_ = os.MkdirAll(m.dst, 0o755) // #nosec G301 -- standard mount points
+		if err := unix.Mount(m.src, m.dst, m.fstype, m.flags, m.data); err != nil && err != unix.EBUSY {
+			lg.Warn("init: mount", log.F("target", m.dst), log.F("error", err.Error()))
+		}
+	}
+}
+
+// mountESP mounts the boot disk's ESP (the partition labelled ESP).
+func mountESP(lg log.Logger) bool {
+	parts, err := switchroot.NewSystem().Partitions()
+	if err != nil {
+		return false
+	}
+	for _, p := range parts {
+		if p.Label == "ESP" {
+			_ = os.MkdirAll(espMount, 0o700)
+			if err := unix.Mount(p.Device, espMount, "vfat", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "umask=0077"); err != nil {
+				lg.Warn("init: mount the ESP", log.F("device", p.Device), log.F("error", err.Error()))
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func readFile(p string) string {
+	b, err := os.ReadFile(filepath.Clean(p))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}

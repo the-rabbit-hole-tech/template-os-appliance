@@ -1,0 +1,584 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package harness boots appliance disk images in QEMU (q35, OVMF with
+// Secure Boot, swtpm) for the image suite, and reads their serial console
+// and their display.
+// A missing tool skips with its name (failing instead when
+// APPLIANCE_REQUIRE_TOOLS is set, as CI does).
+package harness
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// SecureBoot is the firmware's starting state.
+type SecureBoot int
+
+// The firmware states.
+const (
+	// Enrolled: the run's lab PK, KEK and db are in the vars store and
+	// Secure Boot enforces from the first instruction.
+	Enrolled SecureBoot = iota
+	// SetupMode: an empty vars store; the box enrols itself.
+	SetupMode
+	// Off: the Secure Boot firmware with an empty store and enforcement
+	// never turned on.
+	Off
+	// OffWithKeys: keys enrolled (the run's lab keys, standing in for a
+	// vendor's) but enforcement off, so the firmware isn't in Setup Mode:
+	// a VMware VM with Secure Boot turned off in its settings.
+	OffWithKeys
+	// NoSecureBoot: firmware built without Secure Boot (OVMFCodeNoSB), so
+	// the box sees no Secure Boot variables at all, like the first lab
+	// target.
+	NoSecureBoot
+)
+
+// Disk is one disk attached to the VM.
+type Disk struct {
+	// Image is copied before the boot, so the original stays pristine.
+	Image   string
+	SizeGiB int
+	// Move takes Image itself instead of a copy (it's renamed into the
+	// VM's directory), for a disk too big to copy at every boot, such as
+	// the previous boot's Disk with a real product on it.
+	Move bool
+	// Format is the image's format: raw (the default) or qcow2.
+	Format string
+}
+
+func (d Disk) format() string {
+	if d.Format == "" {
+		return "raw"
+	}
+	return d.Format
+}
+
+// Options shape one boot.
+type Options struct {
+	SecureBoot SecureBoot
+	TPM        bool
+	Disks      []Disk
+	// Keys is the lab key directory (build/keys/lab-keys.sh) for Enrolled.
+	Keys   string
+	MemMiB int
+	// CPUs is the number of virtual CPUs (default 2).
+	CPUs    int
+	Timeout time.Duration
+	// NoSerial boots without a serial port, like a VMware VM with none:
+	// the display is the only console.
+	NoSerial bool
+	// NoVGA boots without a display adapter: a headless box, where the
+	// serial line is the only console.
+	NoVGA bool
+	// HostFwd forwards host ports to the guest through QEMU's user network,
+	// as hostfwd rules such as tcp:127.0.0.1:2222-:22.
+	HostFwd []string
+	// GuestFwd forwards a guest connection to the host, as guestfwd rules
+	// such as tcp:<guest address>:<port>-tcp:127.0.0.1:<host port>. QEMU connects to
+	// the host side when it starts, so it must be listening by then.
+	GuestFwd []string
+	// Capture, when set, is a pcap file QEMU writes every frame on the
+	// guest's NIC to (its filter-dump): what the box's network sees.
+	Capture string
+	// SCSI attaches each disk to its own VirtIO SCSI controller, as
+	// Proxmox VE's virtio-scsi-single does, instead of virtio-blk.
+	SCSI bool
+	// GuestAgent adds the virtio-serial port org.qemu.guest_agent.0 that
+	// Proxmox VE gives a VM with the agent on; VM.Agent talks to it.
+	GuestAgent bool
+	// Vars, when set, is a previous boot's vars store (VM.Vars) to boot
+	// with instead of a new one, so what the firmware or the box wrote to
+	// it carries over, as on a reboot. SecureBoot is then ignored.
+	Vars string
+	// TPMState, when set, is a previous boot's TPM state (VM.TPMState),
+	// copied for this boot. It needs TPM.
+	TPMState string
+}
+
+// Paths of the pinned firmware (Ubuntu's ovmf package in CI).
+var (
+	OVMFCode = envOr("APPLIANCE_OVMF_CODE", "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd")
+	OVMFVars = envOr("APPLIANCE_OVMF_VARS", "/usr/share/OVMF/OVMF_VARS_4M.fd")
+	// OVMFCodeNoSB is OVMF built without Secure Boot, for NoSecureBoot.
+	OVMFCodeNoSB = envOr("APPLIANCE_OVMF_CODE_NOSB", "/usr/share/OVMF/OVMF_CODE_4M.fd")
+)
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+// Need skips (or fails, under APPLIANCE_REQUIRE_TOOLS) unless every tool is
+// on PATH and every file exists.
+func Need(t testing.TB, tools []string, files ...string) {
+	t.Helper()
+	var missing []string
+	for _, tool := range tools {
+		if _, err := exec.LookPath(tool); err != nil {
+			missing = append(missing, tool)
+		}
+	}
+	for _, f := range files {
+		if _, err := os.Stat(f); err != nil {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	msg := "missing " + strings.Join(missing, ", ")
+	if os.Getenv("APPLIANCE_REQUIRE_TOOLS") != "" {
+		t.Fatal(msg + " and APPLIANCE_REQUIRE_TOOLS is set")
+	}
+	t.Skip(msg)
+}
+
+// VM is a running boot.
+type VM struct {
+	t      testing.TB
+	cmd    *exec.Cmd
+	serial string
+	cancel context.CancelFunc
+	dir    string
+	done   chan struct{}
+	in     string
+	// qmpSock is QEMU's QMP socket: screendumps and the keyboard.
+	qmpSock string
+	vga     bool
+	// agentSock is the guest agent port's host end, when it has one.
+	agentSock string
+	formats   []string
+}
+
+// Boot starts QEMU with o and returns once it's running.
+func Boot(t testing.TB, o Options) *VM {
+	t.Helper()
+	Need(t, []string{"qemu-system-x86_64", "swtpm", "virt-fw-vars", "qemu-img"}, OVMFCode, OVMFVars)
+	dir := t.TempDir()
+	vars := filepath.Join(dir, "vars.fd")
+	switch {
+	case o.Vars != "":
+		copyFile(t, o.Vars, vars)
+	case o.SecureBoot == Enrolled:
+		owner := "5d4c8e4b-3b9b-4b58-9e2c-0d7e1f2a3b4c"
+		run(t, "virt-fw-vars", "--input", OVMFVars, "--output", vars,
+			"--set-pk", owner, filepath.Join(o.Keys, "PK.crt"),
+			"--add-kek", owner, filepath.Join(o.Keys, "KEK.crt"),
+			"--add-db", owner, filepath.Join(o.Keys, "db.crt"),
+			"--secure-boot")
+	case o.SecureBoot == OffWithKeys:
+		owner := "5d4c8e4b-3b9b-4b58-9e2c-0d7e1f2a3b4c"
+		run(t, "virt-fw-vars", "--input", OVMFVars, "--output", vars,
+			"--set-pk", owner, filepath.Join(o.Keys, "PK.crt"),
+			"--add-kek", owner, filepath.Join(o.Keys, "KEK.crt"),
+			"--add-db", owner, filepath.Join(o.Keys, "db.crt"),
+			// OVMF enforces as soon as a PK is enrolled unless this is off.
+			"--set-false", "SecureBootEnable")
+	default:
+		copyFile(t, OVMFVars, vars)
+	}
+	code := OVMFCode
+	if o.SecureBoot == NoSecureBoot {
+		code = OVMFCodeNoSB
+		Need(t, nil, code)
+	}
+	mem := o.MemMiB
+	if mem == 0 {
+		mem = 2048
+	}
+	cpus := o.CPUs
+	if cpus == 0 {
+		cpus = 2
+	}
+	timeout := o.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	serial := filepath.Join(dir, "serial.log")
+	// The serial line is a pair of FIFOs (QEMU's pipe chardev): the
+	// output is copied into serial.log, and Type writes the input.
+	ser := filepath.Join(dir, "ser")
+	for _, f := range []string{ser + ".in", ser + ".out"} {
+		if err := unix.Mkfifo(f, 0o600); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+	}
+	// O_RDWR so the open doesn't wait for QEMU; the copy ends when QEMU
+	// has exited and this descriptor is closed.
+	pipe, err := os.OpenFile(ser+".out", os.O_RDWR, 0) // #nosec G304 -- the VM's FIFO
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	// A unix socket's path must stay under 108 bytes, which a test's temp
+	// directory can pass.
+	qdir, err := os.MkdirTemp("/tmp", "qmp")
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(qdir) })
+	qmpSock := filepath.Join(qdir, "qmp.sock")
+	args := []string{
+		"-machine", "q35,smm=on", "-m", fmt.Sprint(mem), "-smp", fmt.Sprint(cpus), "-nographic", "-no-reboot",
+		"-global", "driver=cfi.pflash01,property=secure,value=on",
+		"-drive", "if=pflash,format=raw,unit=0,readonly=on,file=" + code,
+		"-drive", "if=pflash,format=raw,unit=1,file=" + vars,
+		"-monitor", "none", "-qmp", "unix:" + qmpSock + ",server=on,wait=off",
+		"-netdev", netdev(o.HostFwd, o.GuestFwd), "-device", "virtio-net-pci,netdev=n0",
+	}
+	if o.Capture != "" {
+		args = append(args, "-object", "filter-dump,id=cap0,netdev=n0,file="+o.Capture)
+	}
+	if o.NoSerial {
+		args = append(args, "-serial", "none")
+	} else {
+		args = append(args, "-chardev", "pipe,id=ser0,path="+ser, "-serial", "chardev:ser0")
+	}
+	if o.NoVGA {
+		args = append(args, "-vga", "none")
+	} else {
+		args = append(args, "-vga", "std")
+	}
+	if _, err := os.Stat("/dev/kvm"); err == nil {
+		args = append(args, "-accel", "kvm", "-cpu", "host")
+	} else {
+		args = append(args, "-accel", "tcg")
+	}
+	if o.TPM {
+		sock := filepath.Join(dir, "swtpm.sock")
+		state := filepath.Join(dir, "tpm")
+		if o.TPMState != "" {
+			run(t, "cp", "-a", o.TPMState, state)
+		} else if err := os.Mkdir(state, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		tpm := exec.CommandContext(ctx, "swtpm", "socket", "--tpm2", "--tpmstate", "dir="+state, "--ctrl", "type=unixio,path="+sock) // #nosec G204 -- test-only, fixed tool
+		if err := tpm.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = tpm.Process.Kill(); _ = tpm.Wait() })
+		waitFor(t, sock)
+		args = append(args, "-chardev", "socket,id=chrtpm,path="+sock, "-tpmdev", "emulator,id=tpm0,chardev=chrtpm", "-device", "tpm-tis,tpmdev=tpm0")
+	}
+	var formats []string
+	for i, d := range o.Disks {
+		f := d.format()
+		formats = append(formats, f)
+		img := filepath.Join(dir, fmt.Sprintf("disk%d.%s", i, f))
+		switch {
+		case d.Image != "" && d.Move:
+			if err := os.Rename(d.Image, img); err != nil {
+				t.Fatal(err)
+			}
+		case d.Image != "":
+			run(t, "cp", "--sparse=always", d.Image, img)
+		default:
+			run(t, "qemu-img", "create", "-f", f, img, fmt.Sprintf("%dG", max(d.SizeGiB, 1)))
+		}
+		if d.Image != "" && d.SizeGiB > 0 {
+			run(t, "qemu-img", "resize", "-f", f, img, fmt.Sprintf("%dG", d.SizeGiB))
+		}
+		args = append(args, "-drive", fmt.Sprintf("if=none,id=d%d,format=%s,file=%s", i, f, img))
+		if o.SCSI {
+			args = append(args, "-device", fmt.Sprintf("virtio-scsi-pci,id=scsi%d", i), "-device", fmt.Sprintf("scsi-hd,drive=d%d,bus=scsi%d.0", i, i))
+		} else {
+			args = append(args, "-device", fmt.Sprintf("virtio-blk-pci,drive=d%d", i))
+		}
+	}
+	var agentSock string
+	if o.GuestAgent {
+		agentSock = filepath.Join(qdir, "qga.sock")
+		args = append(args, "-chardev", "socket,id=qga0,path="+agentSock+",server=on,wait=off",
+			"-device", "virtio-serial-pci,id=qga0s", "-device", "virtserialport,chardev=qga0,name="+AgentPort)
+	}
+	cmd := exec.CommandContext(ctx, "qemu-system-x86_64", args...) // #nosec G204 -- test-only, fixed tool
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	vm := &VM{t: t, cmd: cmd, serial: serial, cancel: cancel, dir: dir, done: make(chan struct{}), in: ser + ".in", qmpSock: qmpSock, vga: !o.NoVGA, agentSock: agentSock, formats: formats}
+	copied := make(chan struct{})
+	go func() {
+		defer close(copied)
+		out, err := os.OpenFile(serial, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- the test's own log
+		if err != nil {
+			return
+		}
+		defer func() { _ = out.Close() }()
+		_, _ = io.Copy(out, pipe)
+	}()
+	go func() {
+		_ = cmd.Wait()
+		// Let the copy drain what QEMU wrote last before it's closed.
+		time.Sleep(500 * time.Millisecond)
+		_ = pipe.Close()
+		<-copied
+		close(vm.done)
+	}()
+	t.Cleanup(func() {
+		var screen []string
+		if t.Failed() && vm.vga && !vm.exited() {
+			screen, _ = vm.screen()
+		}
+		cancel()
+		<-vm.done
+		if len(screen) > 0 {
+			t.Logf("display:\n%s", strings.Join(trimRows(screen), "\n"))
+		}
+		if t.Failed() {
+			b, _ := os.ReadFile(serial) // #nosec G304 -- the test's own log
+			t.Logf("serial console:\n%s\nqemu stderr:\n%s", tail(b, 200), stderr.String())
+		}
+		if s := os.Getenv("GITHUB_STEP_SUMMARY"); s != "" {
+			b, _ := os.ReadFile(serial)                                               // #nosec G304 -- as above
+			if f, err := os.OpenFile(s, os.O_APPEND|os.O_WRONLY, 0o600); err == nil { // #nosec G304 G703 -- the CI summary file GitHub names
+				_, _ = fmt.Fprintf(f, "\n<details><summary>%s serial console</summary>\n\n```\n%s\n```\n</details>\n", t.Name(), tail(b, 80))
+				_ = f.Close()
+			}
+		}
+	})
+	return vm
+}
+
+// netdev is the user network: no way out for the guest (restrict=on) but
+// its guestfwd rules, and only the forwarded ports in.
+func netdev(hostFwd, guestFwd []string) string {
+	n := "user,id=n0,restrict=on"
+	for _, f := range hostFwd {
+		n += ",hostfwd=" + f
+	}
+	for _, f := range guestFwd {
+		n += ",guestfwd=" + f
+	}
+	return n
+}
+
+// Type sends s on the serial line, as typed at the console.
+func (vm *VM) Type(s string) {
+	vm.t.Helper()
+	f, err := os.OpenFile(vm.in, os.O_WRONLY, 0) // #nosec G304 -- the VM's FIFO
+	if err != nil {
+		vm.t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.WriteString(s); err != nil {
+		vm.t.Fatal(err)
+	}
+}
+
+// ansi matches the colour codes init's console log carries.
+var ansi = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// Expect waits until the serial console shows re, or fails the test. The
+// console is matched without its colour codes.
+func (vm *VM) Expect(re string, timeout time.Duration) string {
+	vm.t.Helper()
+	rx := regexp.MustCompile(re)
+	deadline := time.Now().Add(timeout)
+	for {
+		if m := rx.FindString(vm.Console()); m != "" {
+			return m
+		}
+		if time.Now().After(deadline) {
+			vm.t.Fatalf("serial console never showed %q in %s", re, timeout)
+		}
+		if vm.exited() {
+			if m := rx.FindString(vm.Console()); m != "" {
+				return m
+			}
+			vm.t.Fatalf("QEMU exited before the serial console showed %q", re)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// ExpectLine is Expect for a line whose end the test reads, such as
+// `lab-hook: phase pods: .*`: it matches only lines the console has
+// finished. The serial log grows a few bytes at a time as the UART sends
+// them, so Expect can match the start of a line still being written and
+// return only that part. Once QEMU has exited, the last line counts too.
+func (vm *VM) ExpectLine(re string, timeout time.Duration) string {
+	vm.t.Helper()
+	rx := regexp.MustCompile(re)
+	deadline := time.Now().Add(timeout)
+	for {
+		if m := rx.FindString(finishedLines(vm.Console())); m != "" {
+			return m
+		}
+		if time.Now().After(deadline) {
+			vm.t.Fatalf("serial console never showed a whole line with %q in %s", re, timeout)
+		}
+		if vm.exited() {
+			if m := rx.FindString(vm.Console()); m != "" {
+				return m
+			}
+			vm.t.Fatalf("QEMU exited before the serial console showed %q", re)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// finishedLines is console up to its last newline.
+func finishedLines(console string) string {
+	return console[:strings.LastIndexByte(console, '\n')+1]
+}
+
+// Exited is closed once QEMU has exited: a guest reboot (QEMU runs with
+// -no-reboot), a power-off or a kill.
+func (vm *VM) Exited() <-chan struct{} { return vm.done }
+
+func (vm *VM) exited() bool {
+	select {
+	case <-vm.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// Console is the serial console so far, without colour codes.
+func (vm *VM) Console() string {
+	b, _ := os.ReadFile(vm.serial) // #nosec G304 -- the VM's own log
+	return ansi.ReplaceAllString(string(b), "")
+}
+
+// Disk is the path of the VM's copy of disk i. Once the VM has exited it
+// holds what the guest wrote, and a later Boot can take it as its Image
+// (in the same Format).
+func (vm *VM) Disk(i int) string {
+	return filepath.Join(vm.dir, fmt.Sprintf("disk%d.%s", i, vm.formats[i]))
+}
+
+// Vars is the VM's vars store. Once the VM has exited it holds what the
+// firmware and the box wrote (enrolled keys, boot entries), for a later
+// Boot's Options.Vars.
+func (vm *VM) Vars() string { return filepath.Join(vm.dir, "vars.fd") }
+
+// TPMState is the VM's TPM state directory, for a later Boot's
+// Options.TPMState once the VM has exited.
+func (vm *VM) TPMState() string { return filepath.Join(vm.dir, "tpm") }
+
+// Stop powers the VM off (QEMU is killed) and waits for it to go. Its disk
+// keeps what the guest had synced.
+func (vm *VM) Stop() {
+	vm.cancel()
+	<-vm.done
+}
+
+// WaitExit waits for QEMU to exit (a guest reboot, with -no-reboot, or a
+// power-off), or fails the test.
+func (vm *VM) WaitExit(timeout time.Duration) {
+	vm.t.Helper()
+	select {
+	case <-vm.done:
+	case <-time.After(timeout):
+		vm.t.Fatalf("QEMU didn't exit within %s", timeout)
+	}
+}
+
+// The console lines that mean init gave up or a service keeps failing.
+var (
+	initFatal = regexp.MustCompile(`init: fatal|Kernel panic|Attempted to kill init`)
+	restarted = regexp.MustCompile(`services: exited .*restart=true service=([A-Za-z0-9_-]+)`)
+)
+
+// CrashLoopRestarts is how many restarts within a Stable window count as a
+// crash loop.
+const CrashLoopRestarts = 3
+
+// Stable watches the console for window and fails the test if init stops
+// (its fatal line or a kernel panic), QEMU exits, or a service is
+// restarted CrashLoopRestarts times or more. known maps a service to the
+// reason it's expected to crash-loop on this image; it's logged, not
+// failed, and a known service that doesn't loop fails, so the entry is
+// removed once its cause is fixed.
+func (vm *VM) Stable(window time.Duration, known map[string]string) {
+	vm.t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if vm.exited() {
+			vm.t.Fatalf("QEMU exited during the stability window")
+		}
+		if m := initFatal.FindString(vm.Console()); m != "" {
+			vm.t.Fatalf("init stopped: the console shows %q", m)
+		}
+		time.Sleep(time.Second)
+	}
+	counts := map[string]int{}
+	for _, m := range restarted.FindAllStringSubmatch(vm.Console(), -1) {
+		counts[m[1]]++
+	}
+	for name, n := range counts {
+		if n < CrashLoopRestarts {
+			continue
+		}
+		if why, ok := known[name]; ok {
+			vm.t.Logf("%s restarted %d times in %s, as expected on this image: %s", name, n, window, why)
+			continue
+		}
+		vm.t.Errorf("%s is crash-looping: restarted %d times in %s", name, n, window)
+	}
+	for name, why := range known {
+		if counts[name] < CrashLoopRestarts {
+			vm.t.Errorf("%s was expected to crash-loop (%s) but restarted %d times; drop it from the known list", name, why, counts[name])
+		}
+	}
+}
+
+func tail(b []byte, lines int) string {
+	ls := strings.Split(string(b), "\n")
+	if len(ls) > lines {
+		ls = ls[len(ls)-lines:]
+	}
+	return strings.Join(ls, "\n")
+}
+
+func run(t testing.TB, name string, args ...string) {
+	t.Helper()
+	if b, err := exec.Command(name, args...).CombinedOutput(); err != nil { // #nosec G204 -- test-only, fixed tools
+		t.Fatalf("%s: %v\n%s", name, err, b)
+	}
+}
+
+func copyFile(t testing.TB, from, to string) {
+	t.Helper()
+	b, err := os.ReadFile(from) // #nosec G304 -- the firmware file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(to, b, 0o600); err != nil { // #nosec G703 -- a file in the test's own temp directory
+		t.Fatal(err)
+	}
+}
+
+func waitFor(t testing.TB, p string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(p); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("%s never appeared", p)
+}
