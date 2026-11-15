@@ -1,0 +1,184 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// The Power page: reboot, shut down and the factory reset.
+syntax = "proto3";
+
+package appliance.osadmin.v1;
+
+import "google/protobuf/timestamp.proto";
+import "appliance/osadmin/v1/options.proto";
+
+option go_package = "example.org/appliance/gen/go/appliance/osadmin/v1;osadminv1";
+
+// PowerService reboots, shuts down and factory resets the box.
+service PowerService {
+  // GetPower shows what a power action would cut: the active sessions and
+  // any factory reset in progress.
+  rpc GetPower(GetPowerRequest) returns (GetPowerResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+    option (rule) = {role: ROLE_ADMIN};
+  }
+  // Reboot drains and reboots. forced skips the drain and needs
+  // forced_confirmed, the second explicit confirmation.
+  rpc Reboot(RebootRequest) returns (RebootResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      step_up: true
+      audit: "power.reboot"
+    };
+  }
+  // Shutdown drains and powers off; forced as for Reboot.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      step_up: true
+      audit: "power.shutdown"
+    };
+  }
+  // StartFactoryReset opens a reset request; the starter's approval counts
+  // once. Not offered with a single admin.
+  rpc StartFactoryReset(StartFactoryResetRequest) returns (StartFactoryResetResponse) {
+    option (rule) = {
+      role: ROLE_OWNER
+      step_up: true
+      audit: "power.factory-reset.start"
+    };
+  }
+  // ApproveFactoryReset adds a roster member's approval. When M approvals
+  // are in, the 10-minute delay starts.
+  rpc ApproveFactoryReset(ApproveFactoryResetRequest) returns (ApproveFactoryResetResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      step_up: true
+      audit: "power.factory-reset.approve"
+    };
+  }
+  // CancelFactoryReset stops a request or its countdown; any admin may.
+  rpc CancelFactoryReset(CancelFactoryResetRequest) returns (CancelFactoryResetResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      audit: "power.factory-reset.cancel"
+    };
+  }
+  // ListSessions lists every live session on the box: the :8443 browsers,
+  // the SSH closed shells and the elevated shells, oldest first.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+    option (rule) = {role: ROLE_ADMIN};
+  }
+  // EndSession ends one session from ListSessions: a browser is signed
+  // out, an SSH or elevated shell is disconnected.
+  rpc EndSession(EndSessionRequest) returns (EndSessionResponse) {
+    option (rule) = {
+      role: ROLE_OWNER
+      audit: "session.end"
+    };
+  }
+}
+
+// SessionKind is what a session is.
+enum SessionKind {
+  SESSION_KIND_UNSPECIFIED = 0;
+  // SESSION_KIND_BROWSER: a signed-in :8443 browser.
+  SESSION_KIND_BROWSER = 1;
+  // SESSION_KIND_SSH: an admin's SSH login to the closed shell.
+  SESSION_KIND_SSH = 2;
+  // SESSION_KIND_ELEVATED: a one-time elevated root shell.
+  SESSION_KIND_ELEVATED = 3;
+}
+
+// ActiveSession is a live session a power action would end.
+message ActiveSession {
+  string admin = 1;
+  string source_address = 2;
+  // signed_in is when the session started.
+  google.protobuf.Timestamp signed_in = 3;
+  // id names the session for EndSession. It is not the session's cookie.
+  string id = 4;
+  SessionKind kind = 5;
+}
+
+// FactoryResetState is where a factory reset is.
+enum FactoryResetState {
+  FACTORY_RESET_STATE_UNSPECIFIED = 0;
+  // FACTORY_RESET_STATE_PENDING: waiting for approvals.
+  FACTORY_RESET_STATE_PENDING = 1;
+  // FACTORY_RESET_STATE_COUNTDOWN: the quorum approved; the reset runs at
+  // runs_at unless cancelled.
+  FACTORY_RESET_STATE_COUNTDOWN = 2;
+}
+
+message FactoryReset {
+  string id = 1;
+  FactoryResetState state = 2;
+  string started_by = 3;
+  google.protobuf.Timestamp started = 4;
+  // approvals are the roster members who approved, the starter first.
+  repeated string approvals = 5;
+  int32 required = 6;
+  repeated string members = 7;
+  google.protobuf.Timestamp runs_at = 8;
+  google.protobuf.Timestamp expires = 9;
+}
+
+message GetPowerRequest {}
+
+message GetPowerResponse {
+  repeated ActiveSession sessions = 1;
+  FactoryReset factory_reset = 2;
+  // factory_reset_available is false with a single admin or a roster that
+  // can't reach its threshold; the reason says which.
+  bool factory_reset_available = 3;
+  string factory_reset_unavailable_reason = 4;
+}
+
+message RebootRequest {
+  bool forced = 1;
+  bool forced_confirmed = 2;
+}
+
+message RebootResponse {}
+
+message ShutdownRequest {
+  bool forced = 1;
+  bool forced_confirmed = 2;
+}
+
+message ShutdownResponse {}
+
+message StartFactoryResetRequest {
+  // confirm_hostname is the typed confirmation.
+  string confirm_hostname = 1;
+}
+
+message StartFactoryResetResponse {
+  FactoryReset factory_reset = 1;
+}
+
+message ApproveFactoryResetRequest {
+  string id = 1;
+}
+
+message ApproveFactoryResetResponse {
+  FactoryReset factory_reset = 1;
+}
+
+message CancelFactoryResetRequest {
+  string id = 1;
+}
+
+message CancelFactoryResetResponse {}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated ActiveSession sessions = 1;
+}
+
+message EndSessionRequest {
+  // id is an ActiveSession's id.
+  string id = 1;
+}
+
+message EndSessionResponse {}

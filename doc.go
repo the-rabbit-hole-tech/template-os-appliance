@@ -1,4 +1,4 @@
-// Copyright 2026 The Rabbit Hole Tech, LLC
+// Copyright 2026 The Example Authors
 // SPDX-License-Identifier: Apache-2.0
 
 // Package osappliancetemplate is a scaffold placeholder.

@@ -1,0 +1,52 @@
+name: BufLint
+# Lints proto/ with buf's own rules (buf.yaml: lint.use STANDARD) and
+# checks it doesn't break wire compatibility against main (breaking.use
+# FILE). Only runs when there's a proto/ to lint.
+#
+# Pull requests only, and not while the PR is a draft. There is no rerun on
+# push to main: the PR run already checked the tree being merged, so
+# nothing reruns on a branch push or on main (see "CI and Actions minutes"
+# in CLAUDE.md for the ruleset setting that keeps that true).
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  buf-lint:
+    name: BufLint
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          fetch-depth: 0
+      - name: Setup buf
+        uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6  # v1.7.0
+        with:
+          setup_only: true
+          version: 1.57.2
+      - name: Lint
+        run: buf lint
+      # Compared against a local worktree of main: the repo is private, so
+      # buf can't clone it over https without credentials.
+      - name: Breaking change check against main
+        run: |
+          if git cat-file -e origin/main:proto 2>/dev/null; then
+            # A persistent runner can keep a registration for a worktree
+            # whose temp directory was cleaned; prune it or the add fails.
+            git worktree prune
+            git worktree add -q --detach "$RUNNER_TEMP/base" origin/main
+            status=0
+            buf breaking proto --against "$RUNNER_TEMP/base/proto" || status=$?
+            git worktree remove --force "$RUNNER_TEMP/base"
+            exit "$status"
+          else
+            echo "main has no proto yet; nothing to compare against"
+          fi

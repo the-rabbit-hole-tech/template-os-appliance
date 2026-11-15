@@ -2,5 +2,6 @@
 # Ignore everything
 *
 
-# But inject license into Go sources...
+# But inject license into Go and proto sources...
 !*.go
+!*.proto
