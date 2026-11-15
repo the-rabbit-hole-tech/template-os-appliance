@@ -1,0 +1,452 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package imageupgrade
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"path"
+	"sort"
+	"sync/atomic"
+	"time"
+
+	log "github.com/Bugs5382/go-log"
+	"golang.org/x/mod/semver"
+
+	"example.org/appliance/internal/bootcmd"
+	"example.org/appliance/internal/codes"
+	"example.org/appliance/internal/release"
+	"example.org/appliance/internal/ukipcr"
+	"example.org/appliance/internal/verify"
+)
+
+// ESP is the mounted EFI System Partition. WriteFile must be durable
+// (written, synced, renamed into place) before it returns: an upgrade cut
+// off by the reboot it triggers mustn't leave a half-written entry the
+// firmware would try.
+type ESP interface {
+	List(dir string) ([]string, error)
+	WriteFile(rel string, r io.Reader) error
+	Rename(from, to string) error
+	Remove(rel string) error
+	Open(rel string) (io.ReadCloser, error)
+}
+
+// Slots are the two root partitions.
+type Slots interface {
+	// WriteInactive writes the root image to the slot the box isn't
+	// running from and sets that slot's PARTUUID.
+	WriteInactive(ctx context.Context, r io.Reader, size int64, partUUID string) error
+}
+
+// Sealer adds and prunes the state key's sealed copies, one per bootable
+// UKI. In key-file mode both are no-ops.
+type Sealer interface {
+	// SealForImage adds a copy the UKI with SHA-256 ukiSHA will unseal,
+	// given the PCR 11 value its stub will measure.
+	SealForImage(ctx context.Context, ukiSHA string, pcr11 []byte) error
+	// Prune drops every copy whose UKI isn't in keep.
+	Prune(ctx context.Context, keep []string) error
+}
+
+// PredictionChecker is a Sealer that won't trust a PCR 11 prediction this
+// boot hasn't vouched for. Stage hands it predictRunning, the prediction
+// for the running release's UKI as it sits on the ESP; the checker
+// compares it with the PCR 11 the TPM holds now and refuses
+// (UpgradeUnpredictable) when they differ, since then the stub measures
+// something the predictor doesn't know about and a copy sealed to the new
+// UKI's prediction wouldn't unseal. A checker with nothing sealed to PCR 11
+// (key-file mode) returns nil without calling it.
+type PredictionChecker interface {
+	CheckPrediction(ctx context.Context, predictRunning func() ([]byte, error)) error
+}
+
+// Stager runs the Image service's work.
+type Stager struct {
+	ESP    ESP
+	Slots  Slots
+	Sealer Sealer
+	Pins   release.Pins
+	// Running is the version the box booted (appliance.version).
+	Running string
+	// InitVersion is checked against a release's kitMin; empty means the
+	// version stamped into this build.
+	InitVersion string
+	// WorkDir holds the fetched copy of a release while it's staged; Stage
+	// empties it.
+	WorkDir string
+	// Keep is how many releases the box keeps (Keeps); 0 is DefaultKeep.
+	Keep   int
+	Logger log.Logger
+	// written of total is the root image a Stage is writing now.
+	written, total atomic.Int64
+}
+
+// Writing reports how much of a release's root image the Stage under way
+// has written into the inactive slot, of its size; 0 of 0 when no Stage is
+// writing.
+func (s *Stager) Writing() (written, total int64) {
+	return s.written.Load(), s.total.Load()
+}
+
+// counted counts what's read through it into the stager's progress.
+type counted struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c counted) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+// Stage verifies a release against the pins compiled into the running
+// init (the whole chain of spec 1 Section 2.3), refuses a downgrade, writes
+// its root into the inactive slot, adds a sealed copy of the state key for
+// its UKI, and only then adds its ESP entry with three boot tries. The
+// releases Retain drops are removed first (with Keeps of two, every one but
+// the running release), with any cut-off ESP write, and the fetched copy
+// is removed when it returns. Nothing is written before verification
+// completes.
+func (s *Stager) Stage(ctx context.Context, src verify.Source, arch string) (string, error) {
+	lg := s.logger()
+	defer s.tidyWork()
+	d, err := src.Resolve(ctx)
+	if err != nil {
+		return "", err
+	}
+	l, err := src.Fetch(ctx, d, path.Join(s.WorkDir, d.Encoded()))
+	if err != nil {
+		return "", err
+	}
+	iv := s.InitVersion
+	if iv == "" {
+		iv = release.Version
+	}
+	st, err := verify.Run(ctx, verify.Pinned(l, d), s.Pins, verify.Options{Arch: arch, KitVersion: iv, Logger: lg})
+	if err != nil {
+		return "", err
+	}
+	m := st.Manifest
+	ver := m.Metadata.Version
+	if semver.Compare("v"+ver, "v"+s.Running) <= 0 {
+		return "", codes.New(codes.UpgradeDowngrade, "%s isn't newer than the running %s", ver, s.Running)
+	}
+	uki, err := readAll(st, m.Spec.Boot.UKI.File)
+	if err != nil {
+		return "", err
+	}
+	pred, err := ukipcr.Predict(uki)
+	if err != nil {
+		return "", codes.Wrap(codes.UpgradeUnpredictable, err)
+	}
+	if pc, ok := s.Sealer.(PredictionChecker); ok {
+		if err := pc.CheckPrediction(ctx, s.predictRunning); err != nil {
+			lg.Warn("imageupgrade: this boot doesn't vouch for the PCR 11 prediction; nothing staged", log.F("version", ver), log.F("error", err.Error()))
+			return "", err
+		}
+	}
+	guid, err := bootcmd.SlotGUID(m.Spec.Root.Verity.RootHash)
+	if err != nil {
+		return "", codes.Wrap(codes.KitManifestInvalid, err)
+	}
+	root, err := st.Layout.OpenBlob(st.Files[m.Spec.Root.File])
+	if err != nil {
+		return "", err
+	}
+	size := st.Files[m.Spec.Root.File].Size
+	s.written.Store(0)
+	s.total.Store(size)
+	lg.Info("imageupgrade: writing the inactive slot", log.F("version", ver), log.F("bytes", size))
+	err = s.Slots.WriteInactive(ctx, counted{r: root, n: &s.written}, size, guid)
+	s.total.Store(0)
+	s.written.Store(0)
+	_ = root.Close()
+	if err != nil {
+		return "", fmt.Errorf("imageupgrade: write the inactive slot: %w", err)
+	}
+	sum := sha256.Sum256(uki)
+	if err := s.Sealer.SealForImage(ctx, hex.EncodeToString(sum[:]), pred.Value); err != nil {
+		return "", fmt.Errorf("imageupgrade: seal the state key for %s: %w", ver, err)
+	}
+	entries, err := s.entries()
+	if err != nil {
+		return "", err
+	}
+	if err := s.removeEntries(Retain(entries, s.Running, s.Keeps())); err != nil {
+		return "", err
+	}
+	if err := s.tidyESP(); err != nil {
+		return "", err
+	}
+	if err := s.forgetRevert(); err != nil {
+		return "", err
+	}
+	if err := s.ESP.WriteFile(path.Join(UKIDir, EntryName(ver, Tries, 0)), bytes.NewReader(uki)); err != nil {
+		return "", fmt.Errorf("imageupgrade: write the ESP entry: %w", err)
+	}
+	lg.Info("imageupgrade: staged", log.F("version", ver), log.F("tries", Tries))
+	return ver, nil
+}
+
+// Unstage removes the staged release's ESP entry, so it never boots, and
+// prunes the sealed copy made for its UKI. The slot's contents stay for
+// the next Stage to overwrite. With nothing staged it's
+// UPGRADE_NOT_STAGED.
+func (s *Stager) Unstage(ctx context.Context) (string, error) {
+	entries, err := s.entries()
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.Version == s.Running || e.Bad() || !e.Counted || semver.Compare("v"+e.Version, "v"+s.Running) <= 0 {
+			continue
+		}
+		if err := s.removeEntries([]Entry{e}); err != nil {
+			return "", err
+		}
+		s.logger().Info("imageupgrade: unstaged", log.F("version", e.Version), log.F("entry", e.Name))
+		keep, err := s.Kept()
+		if err != nil {
+			return e.Version, err
+		}
+		return e.Version, s.Sealer.Prune(ctx, keep)
+	}
+	return "", codes.New(codes.UpgradeNotStaged, "no release is staged")
+}
+
+// MarkGood makes the running release's entry known good (no counter) and
+// prunes sealed copies for UKIs no longer on the ESP.
+func (s *Stager) MarkGood(ctx context.Context, keep []string) error {
+	entries, err := s.entries()
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.Version == s.Running && e.Counted {
+			if err := s.ESP.Rename(path.Join(UKIDir, e.Name), path.Join(UKIDir, GoodName(e.Version))); err != nil {
+				return err
+			}
+			s.logger().Info("imageupgrade: marked good", log.F("version", e.Version))
+		}
+	}
+	return s.Sealer.Prune(ctx, keep)
+}
+
+// Kept is what MarkGood keeps sealed copies for: the SHA-256 of every UKI
+// on the ESP (the running release, and the previous or the staged one, so
+// either still unseals the state), and "" for the copy made at install
+// time, which names no UKI and may be the previous release's only one.
+func (s *Stager) Kept() ([]string, error) {
+	entries, err := s.entries()
+	if err != nil {
+		return nil, err
+	}
+	keep := []string{""}
+	for _, e := range entries {
+		f, err := s.ESP.Open(path.Join(UKIDir, e.Name))
+		if err != nil {
+			return nil, err
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, f)
+		_ = f.Close()
+		if err != nil {
+			return nil, fmt.Errorf("imageupgrade: read %s: %w", e.Name, err)
+		}
+		keep = append(keep, hex.EncodeToString(h.Sum(nil)))
+	}
+	return keep, nil
+}
+
+// RevertedFile is the ESP file that records a manual revert, so Status
+// tells it apart from a boot-counting fallback: both leave the newer entry
+// with no tries left.
+const RevertedFile = "loader/appliance-reverted.json"
+
+// Reverted is a manual revert: the release reverted from, the admin who
+// asked and when.
+type Reverted struct {
+	Version string    `json:"version"`
+	By      string    `json:"by"`
+	At      time.Time `json:"at"`
+}
+
+// Rollback marks the running release bad so systemd-boot boots the
+// previous one next, and records that by asked for it at at. With no
+// previous release it's UPGRADE_NO_PREVIOUS. The record is written first:
+// if the rename then fails, it names a release that isn't bad, and Status
+// ignores it.
+func (s *Stager) Rollback(by string, at time.Time) error {
+	entries, err := s.entries()
+	if err != nil {
+		return err
+	}
+	var running *Entry
+	previous := false
+	for i, e := range entries {
+		switch {
+		case e.Version == s.Running:
+			running = &entries[i]
+		case !e.Bad():
+			previous = true
+		}
+	}
+	if running == nil || !previous {
+		return codes.New(codes.UpgradeNoPrevious, "there's no previous release to roll back to")
+	}
+	b, err := json.Marshal(Reverted{Version: running.Version, By: by, At: at.UTC()})
+	if err != nil {
+		return err
+	}
+	if err := s.ESP.WriteFile(RevertedFile, bytes.NewReader(b)); err != nil {
+		return fmt.Errorf("imageupgrade: record the revert: %w", err)
+	}
+	s.logger().Info("imageupgrade: revert recorded", log.F("version", running.Version), log.F("by", by))
+	return s.ESP.Rename(path.Join(UKIDir, running.Name), path.Join(UKIDir, EntryName(running.Version, 0, running.Done+1)))
+}
+
+// Status is what the Image service reports.
+type Status struct {
+	Running string
+	Staged  string
+	// Failed is a newer release that used up its tries: boot counting
+	// fell back from it.
+	Failed string
+	// Reverted is set instead of Failed when an admin reverted from the
+	// newer release (Rollback).
+	Reverted Reverted
+	// Previous is the older release kept on the ESP that Rollback would
+	// boot: the revert target. Empty when there's none.
+	Previous string
+	// NextStageRemoves are the releases the next Stage removes (Retain).
+	NextStageRemoves []string
+}
+
+// Status reads the entries.
+func (s *Stager) Status() (Status, error) {
+	entries, err := s.entries()
+	if err != nil {
+		return Status{}, err
+	}
+	st := Status{Running: s.Running, NextStageRemoves: versionsOf(Retain(entries, s.Running, s.Keeps()))}
+	rev := s.revert()
+	for _, e := range entries {
+		if e.Version == s.Running {
+			continue
+		}
+		newer := semver.Compare("v"+e.Version, "v"+s.Running) > 0
+		switch {
+		case newer && e.Bad() && rev.Version == e.Version:
+			st.Reverted = rev
+		case newer && e.Bad():
+			st.Failed = e.Version
+		case newer && e.Counted:
+			st.Staged = e.Version
+		case !newer && !e.Bad() && semver.Compare("v"+e.Version, "v"+st.Previous) > 0:
+			st.Previous = e.Version
+		}
+	}
+	return st, nil
+}
+
+// revert reads the revert record; a missing or unreadable one is no
+// revert.
+func (s *Stager) revert() Reverted {
+	f, err := s.ESP.Open(RevertedFile)
+	if err != nil {
+		return Reverted{}
+	}
+	defer func() { _ = f.Close() }()
+	var r Reverted
+	if err := json.NewDecoder(io.LimitReader(f, 4096)).Decode(&r); err != nil {
+		s.logger().Warn("imageupgrade: the revert record doesn't read; ignored", log.F("error", err.Error()))
+		return Reverted{}
+	}
+	return r
+}
+
+// forgetRevert removes the revert record: a newly staged release starts
+// with a clean slate.
+func (s *Stager) forgetRevert() error {
+	if err := s.ESP.Remove(RevertedFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("imageupgrade: remove the revert record: %w", err)
+	}
+	return nil
+}
+
+func (s *Stager) entries() ([]Entry, error) {
+	names, err := s.ESP.List(UKIDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []Entry
+	for _, n := range names {
+		if e, ok := ParseEntry(n); ok {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// predictRunning is the PCR 11 the running release's UKI measures, read
+// from its ESP entry, counted or not.
+func (s *Stager) predictRunning() ([]byte, error) {
+	entries, err := s.entries()
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		if e.Version != s.Running {
+			continue
+		}
+		f, err := s.ESP.Open(path.Join(UKIDir, e.Name))
+		if err != nil {
+			return nil, codes.Wrap(codes.UpgradeUnpredictable, err)
+		}
+		b, err := io.ReadAll(f)
+		_ = f.Close()
+		if err != nil {
+			return nil, codes.Wrap(codes.UpgradeUnpredictable, err)
+		}
+		p, err := ukipcr.Predict(b)
+		if err != nil {
+			return nil, codes.Wrap(codes.UpgradeUnpredictable, fmt.Errorf("the running %s's UKI: %w", s.Running, err))
+		}
+		return p.Value, nil
+	}
+	return nil, codes.New(codes.UpgradeUnpredictable, "the running %s has no entry on the ESP to predict", s.Running)
+}
+
+func (s *Stager) logger() log.Logger {
+	if s.Logger == nil {
+		return log.Nop()
+	}
+	return s.Logger
+}
+
+func readAll(st *verify.State, title string) ([]byte, error) {
+	f, err := st.Layout.OpenBlob(st.Files[title])
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, 512<<20))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) != st.Files[title].Size {
+		return nil, errors.New("imageupgrade: the UKI is larger than 512 MiB")
+	}
+	return b, nil
+}
