@@ -1,0 +1,184 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package accessd_test
+
+import (
+	"context"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+
+	accessv1 "example.org/appliance/gen/go/appliance/access/v1"
+	"example.org/appliance/gen/go/appliance/access/v1/accessv1connect"
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/gen/go/appliance/osadmin/v1/osadminv1connect"
+	"example.org/appliance/internal/access"
+	"example.org/appliance/internal/elevation"
+)
+
+// revoked asks OpenSSH's ssh-keygen, which reads the list as sshd does,
+// whether key is on accessd's revocation list.
+func (b *box) revoked(key sshKey) bool {
+	b.t.Helper()
+	bin, err := exec.LookPath("ssh-keygen")
+	if err != nil {
+		if os.Getenv("APPLIANCE_REQUIRE_TOOLS") != "" {
+			b.t.Fatal("ssh-keygen isn't installed and APPLIANCE_REQUIRE_TOOLS is set")
+		}
+		b.t.Skip("ssh-keygen isn't installed")
+	}
+	file := filepath.Join(b.t.TempDir(), "key.pub")
+	if err := os.WriteFile(file, []byte(key.line+"\n"), 0o600); err != nil {
+		b.t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "-Q", "-f", filepath.Join(b.state, "ssh", elevation.RevokedFile), file).CombinedOutput() // #nosec G204 -- the test's own ssh-keygen
+	if err != nil && !strings.Contains(string(out), "REVOKED") {
+		b.t.Fatalf("ssh-keygen -Q: %v %s", err, out)
+	}
+	return strings.Contains(string(out), "REVOKED")
+}
+
+func (b *box) consoleAccess() accessv1connect.AccessServiceClient {
+	hc, url := b.console()
+	return accessv1connect.NewAccessServiceClient(hc, url)
+}
+
+// The key goes on the list in the store's own write, so a render that
+// fails right after (netd is down) still leaves sshd refusing it.
+func TestARemovedKeyIsRevokedEvenWhenTheRenderFails(t *testing.T) {
+	b := newBox(t)
+	ctx := context.Background()
+	if b.revoked(b.keys["bob"]) {
+		t.Fatal("bob's key is revoked before it's removed")
+	}
+	b.netd.mu.Lock()
+	b.netd.down = true
+	b.netd.mu.Unlock()
+	if _, err := b.consoleAccess().RemoveKey(ctx, connect.NewRequest(&accessv1.RemoveKeyRequest{Admin: "bob", Fingerprint: b.keys["bob"].fp})); err != nil {
+		t.Fatal(err)
+	}
+	if !b.revoked(b.keys["bob"]) {
+		t.Fatal("the removed key isn't on the revocation list")
+	}
+	if b.revoked(b.keys["alice"]) {
+		t.Fatal("a kept key is revoked")
+	}
+}
+
+func TestRemovingAnAdminRevokesTheirKeys(t *testing.T) {
+	b := newBox(t)
+	if _, err := b.consoleAccess().RemoveAdmin(context.Background(), connect.NewRequest(&accessv1.RemoveAdminRequest{Name: "bob"})); err != nil {
+		t.Fatal(err)
+	}
+	if !b.revoked(b.keys["bob"]) {
+		t.Fatal("the removed admin's key isn't on the revocation list")
+	}
+}
+
+// A root shell opened with the key ends with it.
+func TestRemovingAKeyEndsItsRootShell(t *testing.T) {
+	b := newBox(t)
+	ctx := context.Background()
+	st := b.store.Read()
+	c := elevation.Caller{Admin: "bob", KeyFP: b.keys["bob"].fp, Source: "192.0.2.50"}
+	r, err := b.elev.Challenge(st, c, "investigate kubelet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, code, err := b.elev.IssueCode(st, "bob", r.Challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ticket, err := b.elev.Open(st, c, r.Challenge, code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.elevationAs(0, "").BeginElevatedSession(ctx, connect.NewRequest(&accessv1.BeginElevatedSessionRequest{Ticket: ticket, Admin: "bob", Pid: 4242})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.consoleAccess().RemoveKey(ctx, connect.NewRequest(&accessv1.RemoveKeyRequest{Admin: "bob", Fingerprint: b.keys["bob"].fp})); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.signalled(); !slices.Equal(got, []int{4242}) {
+		t.Fatalf("signals %v", got)
+	}
+}
+
+// A revoked key stays on the list until an owner un-revokes it on :8443
+// (step-up, audited).
+func TestARevokedKeyComesBackOnlyThroughAnOwnersUnrevoke(t *testing.T) {
+	b := newBox(t)
+	ctx := context.Background()
+	gone := b.keys["bob"]
+	if _, err := b.consoleAccess().RemoveKey(ctx, connect.NewRequest(&accessv1.RemoveKeyRequest{Admin: "bob", Fingerprint: gone.fp})); err != nil {
+		t.Fatal(err)
+	}
+	if !b.revoked(gone) {
+		t.Fatal("the removed key isn't revoked")
+	}
+	hc, url := b.osadmin()
+	api := osadminv1connect.NewAccessServiceClient(hc, url)
+	cookie, csrf := b.signIn("alice")
+	list, err := api.ListAdmins(ctx, withSession(connect.NewRequest(&osadminv1.ListAdminsRequest{}), cookie, csrf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk := list.Msg.GetRevokedKeys()
+	if len(rk) != 1 || rk[0].GetFingerprint() != gone.fp || rk[0].GetAdmin() != "bob" || rk[0].GetType() != "ssh-ed25519" || rk[0].GetRevoked() == nil {
+		t.Fatalf("revoked keys %v", rk)
+	}
+	if _, err := api.UnrevokeKey(ctx, withSession(connect.NewRequest(&osadminv1.UnrevokeKeyRequest{Fingerprint: gone.fp}), cookie, csrf)); err != nil {
+		t.Fatal(err)
+	}
+	if en := lastEntry(t, b.log, "access.key.unrevoke"); en.Actor != "alice" || en.Outcome != "ok" || en.Target != "revoked login key" || en.Detail["key"] != gone.fp {
+		t.Fatalf("%+v", en)
+	}
+	if b.revoked(gone) {
+		t.Fatal("the un-revoked key is still on the list")
+	}
+	_, err = api.UnrevokeKey(ctx, withSession(connect.NewRequest(&osadminv1.UnrevokeKeyRequest{Fingerprint: gone.fp}), cookie, csrf))
+	symbolIn(t, err, connect.CodeInvalidArgument, "ACCESS_KEY_TYPE")
+}
+
+// Each revocation names who removed the key: the admin on :8443 or in the
+// closed shell, or the console.
+func TestARevokedKeyNamesWhoRemovedIt(t *testing.T) {
+	b := newBox(t)
+	ctx := context.Background()
+	b.addAdmin("carol", access.RoleAdmin)
+	b.addAdmin("dave", access.RoleAdmin)
+	if _, err := b.shell("bob").RemoveKey(ctx, connect.NewRequest(&accessv1.RemoveKeyRequest{Fingerprint: b.keys["bob"].fp})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.consoleAccess().RemoveKey(ctx, connect.NewRequest(&accessv1.RemoveKeyRequest{Admin: "dave", Fingerprint: b.keys["dave"].fp})); err != nil {
+		t.Fatal(err)
+	}
+	hc, url := b.osadmin()
+	api := osadminv1connect.NewAccessServiceClient(hc, url)
+	cookie, csrf := b.signIn("alice")
+	if _, err := api.RemoveAdmin(ctx, withSession(connect.NewRequest(&osadminv1.RemoveAdminRequest{Name: "carol"}), cookie, csrf)); err != nil {
+		t.Fatal(err)
+	}
+	list, err := api.ListAdmins(ctx, withSession(connect.NewRequest(&osadminv1.ListAdminsRequest{}), cookie, csrf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range list.Msg.GetRevokedKeys() {
+		got[r.GetAdmin()] = r.GetRevokedBy()
+	}
+	want := map[string]string{"bob": "bob", "dave": access.ConsoleActor, "carol": "alice"}
+	if !maps.Equal(got, want) {
+		t.Fatalf("revoked by %v, want %v", got, want)
+	}
+}

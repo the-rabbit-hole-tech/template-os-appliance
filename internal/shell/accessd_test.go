@@ -1,0 +1,324 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package shell_test
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+
+	accessv1 "example.org/appliance/gen/go/appliance/access/v1"
+	"example.org/appliance/gen/go/appliance/access/v1/accessv1connect"
+	netdv1 "example.org/appliance/gen/go/appliance/netd/v1"
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/internal/accessapi"
+	"example.org/appliance/internal/codes"
+	"example.org/appliance/internal/shell"
+)
+
+// fakeAccessd is accessd's local API as the shell sees it.
+type fakeAccessd struct {
+	accessv1connect.UnimplementedAccessServiceHandler
+	accessv1connect.UnimplementedNetworkServiceHandler
+	mu       sync.Mutex
+	headers  []http.Header
+	settings *netdv1.Settings
+	set      []*netdv1.Settings
+	// staged and review are what's waiting for a commit.
+	staged *netdv1.Settings
+	review *osadminv1.StagedReview
+	// commitErr refuses a commit, as a dead gateway does.
+	commitErr error
+	committed []string
+	discarded int
+}
+
+func (f *fakeAccessd) saw(h http.Header) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.headers = append(f.headers, h.Clone())
+}
+
+func (f *fakeAccessd) GetStatus(_ context.Context, r *connect.Request[accessv1.GetStatusRequest]) (*connect.Response[accessv1.GetStatusResponse], error) {
+	f.saw(r.Header())
+	return connect.NewResponse(&accessv1.GetStatusResponse{Status: &osadminv1.GetStatusResponse{
+		Hostname: "box1.appliance.example.org", Version: "0.1.0", Phase: "normal", ManagementAddresses: []string{"192.0.2.10"},
+		Warnings: []*osadminv1.Warning{{Detail: "The clock isn't synchronised with an NTP server."}},
+	}}), nil
+}
+
+func (f *fakeAccessd) ListKeys(_ context.Context, r *connect.Request[accessv1.ListKeysRequest]) (*connect.Response[accessv1.ListKeysResponse], error) {
+	f.saw(r.Header())
+	if r.Msg.GetAdmin() == "bob" {
+		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("ACCESS_FORBIDDEN (3009): an admin sees only their own keys"))
+	}
+	return connect.NewResponse(&accessv1.ListKeysResponse{Admin: "alice", Keys: []*osadminv1.Key{{Fingerprint: "SHA256:abc", Type: "ssh-ed25519", Comment: "laptop"}}}), nil
+}
+
+func (f *fakeAccessd) GetNetwork(context.Context, *connect.Request[accessv1.GetNetworkRequest]) (*connect.Response[accessv1.GetNetworkResponse], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := &accessv1.GetNetworkResponse{Settings: f.settings, ManagementAddresses: []string{"192.0.2.10/24"}, NtpSynced: true}
+	if f.staged != nil {
+		out.Staged, out.StagedId, out.StagedReview = f.staged, "stg-1", f.review
+	}
+	return connect.NewResponse(out), nil
+}
+
+func (f *fakeAccessd) StageNetwork(_ context.Context, r *connect.Request[accessv1.StageNetworkRequest]) (*connect.Response[accessv1.StageNetworkResponse], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.set = append(f.set, r.Msg.GetSettings())
+	f.staged = r.Msg.GetSettings()
+	return connect.NewResponse(&accessv1.StageNetworkResponse{StagedId: "stg-1"}), nil
+}
+
+func (f *fakeAccessd) DiscardStagedNetwork(context.Context, *connect.Request[accessv1.DiscardStagedNetworkRequest]) (*connect.Response[accessv1.DiscardStagedNetworkResponse], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.staged = nil
+	f.discarded++
+	return connect.NewResponse(&accessv1.DiscardStagedNetworkResponse{}), nil
+}
+
+func (f *fakeAccessd) CommitNetwork(_ context.Context, r *connect.Request[accessv1.CommitNetworkRequest]) (*connect.Response[accessv1.CommitNetworkResponse], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.commitErr != nil {
+		return nil, f.commitErr
+	}
+	f.committed = append(f.committed, r.Msg.GetStagedId())
+	f.settings, f.staged = f.staged, nil
+	return connect.NewResponse(&accessv1.CommitNetworkResponse{TestedGateways: []string{"192.0.2.1"}, Review: f.review}), nil
+}
+
+func withAccessd(t *testing.T, f *fakeAccessd) (*shell.Services, *httptest.Server) {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.Handle(accessv1connect.NewAccessServiceHandler(f))
+	mux.Handle(accessv1connect.NewNetworkServiceHandler(f))
+	mux.Handle(accessv1connect.NewElevationServiceHandler(accessv1connect.UnimplementedElevationServiceHandler{}))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	s := &shell.Services{
+		Session:    shell.Session{Admin: "alice", KeyFingerprint: "SHA256:abc", Source: "192.0.2.60"},
+		StatusFile: filepath.Join(t.TempDir(), "status.json"),
+	}
+	s.UseAccessd(http.DefaultClient, srv.URL)
+	return s, srv
+}
+
+// The shell's accessd commands reach accessd, each with the key that
+// signed the login in and the SSH client's address.
+func TestAccessdCommandsReachAccessd(t *testing.T) {
+	f := &fakeAccessd{}
+	s, _ := withAccessd(t, f)
+	out, _, err := runWith(t, s, "keys list", "")
+	if err != nil || !strings.Contains(out, "SHA256:abc") || !strings.Contains(out, "laptop") {
+		t.Fatalf("%v %q", err, out)
+	}
+	if h := f.headers[0]; h.Get(accessapi.KeyHeader) != "SHA256:abc" || h.Get(accessapi.SourceHeader) != "192.0.2.60" {
+		t.Fatalf("%v", h)
+	}
+	_, stderr, err := runWith(t, s, "keys list --admin bob", "")
+	if !codes.Is(err, codes.AccessForbidden) || !strings.Contains(stderr, "only their own keys") {
+		t.Fatalf("%v %q", err, stderr)
+	}
+}
+
+func TestStatusFromAccessd(t *testing.T) {
+	s, _ := withAccessd(t, &fakeAccessd{})
+	out, _, err := runWith(t, s, "status", "")
+	if err != nil || !strings.Contains(out, "box1.appliance.example.org") || !strings.Contains(out, "0.1.0") || !strings.Contains(out, "NTP server") {
+		t.Fatalf("%v %q", err, out)
+	}
+}
+
+// With accessd down, status shows the last one accessd kept, saying so,
+// and every other accessd command says the services are unavailable.
+func TestAccessdDownLeavesCachedStatus(t *testing.T) {
+	s, srv := withAccessd(t, &fakeAccessd{})
+	srv.Close()
+	_, stderr, err := runWith(t, s, "status", "")
+	if !codes.Is(err, codes.NotAvailable) || !strings.Contains(stderr, accessapi.Unavailable) {
+		t.Fatalf("no cache yet: %v %q", err, stderr)
+	}
+	saved := time.Date(2026, 10, 7, 14, 0, 0, 0, time.UTC)
+	if err := accessapi.WriteStatusCache(s.StatusFile, &osadminv1.GetStatusResponse{Hostname: "box1.appliance.example.org", Version: "0.1.0"}, saved); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := runWith(t, s, "status", "")
+	if err != nil || !strings.Contains(out, "appliance services are unavailable") || !strings.Contains(out, "2026-10-07T14:00:00Z") || !strings.Contains(out, "box1.appliance.example.org") {
+		t.Fatalf("%v %q", err, out)
+	}
+	for _, line := range []string{"keys list", "admins list", "network show"} {
+		_, stderr, err := runWith(t, s, line, "y\n")
+		if !codes.Is(err, codes.NotAvailable) || !strings.Contains(stderr, "appliance services are unavailable") {
+			t.Errorf("%q: %v %q", line, err, stderr)
+		}
+	}
+}
+
+// network set stages only the keys given, on top of the current settings.
+func TestNetworkSet(t *testing.T) {
+	f := &fakeAccessd{settings: &netdv1.Settings{Hostname: "old.appliance.example.org", Ntp: []string{"192.0.2.1"}}}
+	s, _ := withAccessd(t, f)
+	out, _, err := runWith(t, s, "network set hostname=box2.appliance.example.org dns=192.0.2.53,192.0.2.54", "")
+	if err != nil || !strings.Contains(out, "network commit") {
+		t.Fatalf("%v %q", err, out)
+	}
+	got := f.set[0]
+	if got.GetHostname() != "box2.appliance.example.org" || strings.Join(got.GetDns(), ",") != "192.0.2.53,192.0.2.54" || strings.Join(got.GetNtp(), ",") != "192.0.2.1" {
+		t.Fatalf("%v", got)
+	}
+	_, _, err = runWith(t, s, "network set mtu=9000", "")
+	if !codes.Is(err, codes.ShellParse) {
+		t.Fatalf("%v", err)
+	}
+}
+
+// network set takes the management interface's IPv4 and IPv6 mode and
+// address too: ipv4, ipv4-address, ipv4-gateway and the ipv6
+// equivalents, on top of whatever the interface already has.
+func TestNetworkSetIPv4AndIPv6(t *testing.T) {
+	f := &fakeAccessd{settings: &netdv1.Settings{Hostname: "box.appliance.example.org", Management: &netdv1.Interface{Name: "ens192"}}}
+	s, _ := withAccessd(t, f)
+	out, _, err := runWith(t, s, "network set ipv4=static ipv4-address=192.0.2.10/24 ipv4-gateway=192.0.2.1 ipv6=static ipv6-address=2001:db8::10/64 ipv6-gateway=2001:db8::1", "")
+	if err != nil || !strings.Contains(out, "network commit") {
+		t.Fatalf("%v %q", err, out)
+	}
+	got := f.set[0].GetManagement()
+	if got.GetName() != "ens192" || got.GetIpv4().GetMode() != netdv1.Ipv4Mode_IPV4_MODE_STATIC || got.GetIpv4().GetAddress() != "192.0.2.10/24" || got.GetIpv4().GetGateway() != "192.0.2.1" ||
+		got.GetIpv6().GetMode() != netdv1.Ipv6Mode_IPV6_MODE_STATIC || got.GetIpv6().GetAddress() != "2001:db8::10/64" || got.GetIpv6().GetGateway() != "2001:db8::1" {
+		t.Fatalf("%v", got)
+	}
+
+	// Off, and a cleared gateway: the existing interface stays named, the
+	// address keys clear.
+	out, _, err = runWith(t, s, "network set ipv4=off ipv4-address= ipv4-gateway=", "")
+	if err != nil || !strings.Contains(out, "network commit") {
+		t.Fatalf("%v %q", err, out)
+	}
+	got = f.set[1].GetManagement()
+	if got.GetIpv4().GetMode() != netdv1.Ipv4Mode_IPV4_MODE_OFF || got.GetIpv4().GetAddress() != "" || got.GetIpv4().GetGateway() != "" {
+		t.Fatalf("%v", got)
+	}
+
+	// Back to DHCP, completing the round trip.
+	out, _, err = runWith(t, s, "network set ipv4=dhcp", "")
+	if err != nil || !strings.Contains(out, "network commit") {
+		t.Fatalf("%v %q", err, out)
+	}
+	if got := f.set[2].GetManagement().GetIpv4().GetMode(); got != netdv1.Ipv4Mode_IPV4_MODE_DHCP {
+		t.Fatalf("%v", got)
+	}
+
+	// An unrecognized mode is refused here, before anything reaches netd.
+	_, _, err = runWith(t, s, "network set ipv4=bogus", "")
+	if !codes.Is(err, codes.ShellParse) {
+		t.Fatalf("%v", err)
+	}
+	if len(f.set) != 3 {
+		t.Fatalf("netd was asked: %v", f.set)
+	}
+}
+
+// The root shell's two calls reach accessd's ElevationService, which
+// answers Not available when the box has none.
+func TestTheRootShellCallsAccessd(t *testing.T) {
+	s, _ := withAccessd(t, &fakeAccessd{})
+	_, err := s.Call(context.Background(), shell.Request{Action: "rootshell.begin"})
+	if !codes.Is(err, codes.NotAvailable) {
+		t.Fatalf("%v", err)
+	}
+}
+
+// A second network set builds on what's staged, so two commands make one
+// change.
+func TestNetworkSetBuildsOnTheStage(t *testing.T) {
+	f := &fakeAccessd{settings: &netdv1.Settings{Hostname: "box.appliance.example.org", Management: &netdv1.Interface{Name: "ens192"}}}
+	s, _ := withAccessd(t, f)
+	if _, _, err := runWith(t, s, "network set ipv4=static ipv4-address=192.0.2.50/24", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runWith(t, s, "network set ipv4-gateway=192.0.2.1", ""); err != nil {
+		t.Fatal(err)
+	}
+	got := f.set[1].GetManagement().GetIpv4()
+	if got.GetAddress() != "192.0.2.50/24" || got.GetGateway() != "192.0.2.1" {
+		t.Fatalf("%v", got)
+	}
+}
+
+// network show lists what's staged, and only what it changes.
+func TestNetworkShowShowsWhatsStaged(t *testing.T) {
+	cur := &netdv1.Settings{Hostname: "box.appliance.example.org", Dns: []string{"192.0.2.53"}, Management: &netdv1.Interface{Name: "ens192", Ipv4: &netdv1.Ipv4{Mode: netdv1.Ipv4Mode_IPV4_MODE_DHCP}}}
+	f := &fakeAccessd{settings: cur}
+	s, _ := withAccessd(t, f)
+	out, _, err := runWith(t, s, "network show", "")
+	if err != nil || strings.Contains(out, "Staged") {
+		t.Fatalf("%v %q", err, out)
+	}
+	f.staged = &netdv1.Settings{Hostname: cur.GetHostname(), Dns: cur.GetDns(), Management: &netdv1.Interface{Name: "ens192", Ipv4: &netdv1.Ipv4{Mode: netdv1.Ipv4Mode_IPV4_MODE_STATIC, Address: "192.0.2.50/24", Gateway: "192.0.2.1"}}}
+	out, _, err = runWith(t, s, "network show", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, staged, ok := strings.Cut(out, "Staged")
+	if !ok || !strings.Contains(staged, "static 192.0.2.50/24 via 192.0.2.1 (now dhcp)") || !strings.Contains(staged, "network commit") {
+		t.Fatalf("%q", out)
+	}
+	if strings.Contains(staged, "hostname") || strings.Contains(staged, "dns") {
+		t.Fatalf("listed what it doesn't change: %q", staged)
+	}
+}
+
+func TestNetworkCommitThroughAccessd(t *testing.T) {
+	f := &fakeAccessd{settings: &netdv1.Settings{Hostname: "box.appliance.example.org"},
+		staged: &netdv1.Settings{Hostname: "box.appliance.example.org"},
+		review: &osadminv1.StagedReview{MovesManagement: true, NewAddress: "192.0.2.50", ChangesAllowList: true}}
+	s, _ := withAccessd(t, f)
+	out, stderr, err := runWith(t, s, "network commit", "")
+	if err != nil || !strings.Contains(stderr, "Reconnect to 192.0.2.50") || !strings.Contains(stderr, "allow-list") {
+		t.Fatalf("%v %q %q", err, out, stderr)
+	}
+	if strings.Join(f.committed, ",") != "stg-1" || !strings.Contains(out, "The gateway 192.0.2.1 answered") || !strings.Contains(out, "Applied and saved") {
+		t.Fatalf("%v %q", f.committed, out)
+	}
+}
+
+// A refused commit is an error the admin reads, by code.
+func TestNetworkCommitRefused(t *testing.T) {
+	f := &fakeAccessd{settings: &netdv1.Settings{}, staged: &netdv1.Settings{},
+		commitErr: connect.NewError(connect.CodeFailedPrecondition, errors.New("NET_GATEWAY (3404): the gateway 192.0.2.1 doesn't answer from 192.0.2.50/24, so nothing was changed"))}
+	s, _ := withAccessd(t, f)
+	_, stderr, err := runWith(t, s, "network commit", "")
+	if err == nil || !strings.Contains(stderr, "the gateway 192.0.2.1 doesn't answer") || !strings.Contains(stderr, "NET_GATEWAY") {
+		t.Fatalf("%v %q", err, stderr)
+	}
+}
+
+func TestNetworkCommitWithNothingStagedThroughAccessd(t *testing.T) {
+	f := &fakeAccessd{settings: &netdv1.Settings{}}
+	s, _ := withAccessd(t, f)
+	if _, _, err := runWith(t, s, "network commit", ""); !codes.Is(err, codes.NetInvalid) {
+		t.Fatal(err)
+	}
+}
+
+func TestNetworkDiscardThroughAccessd(t *testing.T) {
+	f := &fakeAccessd{settings: &netdv1.Settings{}, staged: &netdv1.Settings{}}
+	s, _ := withAccessd(t, f)
+	if _, _, err := runWith(t, s, "network discard", ""); err != nil || f.discarded != 1 {
+		t.Fatalf("%v %d", err, f.discarded)
+	}
+}

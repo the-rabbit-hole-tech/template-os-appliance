@@ -1,0 +1,30 @@
+# Rendered by accessd from the access store; changes here are overwritten.
+ListenAddress 192.0.2.10:22
+ListenAddress [2001:db8::10]:22
+HostKey /var/lib/appliance/ssh/ssh_host_ed25519_key
+HostKey /var/lib/appliance/ssh/ssh_host_rsa_key
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AuthorizedKeysFile none
+TrustedUserCAKeys /var/lib/appliance/ssh/root_key.pub
+DisableForwarding yes
+PermitTunnel no
+PermitUserRC no
+PermitUserEnvironment no
+StrictModes yes
+RevokedKeys /var/lib/appliance/ssh/revoked.krl
+ExposeAuthInfo yes
+ForceCommand /usr/bin/appliance-shell
+Banner /run/appliance/ssh/banner
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 60
+ClientAliveCountMax 3
+LogLevel VERBOSE
+PidFile none
+AllowUsers alice bob
+# No Subsystem lines: no sftp, no scp.

@@ -1,0 +1,252 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package shell_test
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"testing"
+
+	"connectrpc.com/connect"
+
+	accessv1 "example.org/appliance/gen/go/appliance/access/v1"
+	"example.org/appliance/gen/go/appliance/access/v1/accessv1connect"
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/internal/accessapi"
+	"example.org/appliance/internal/productinfo"
+	"example.org/appliance/internal/shell"
+)
+
+type resetAccessd struct {
+	fakeAccessd
+	resets     []*accessv1.ResetProductRequest
+	reinstalls []*accessv1.ReinstallProductRequest
+	removals   []*accessv1.RemoveKeptDumpRequest
+}
+
+func (f *resetAccessd) ListKeptDumps(_ context.Context, r *connect.Request[accessv1.ListKeptDumpsRequest]) (*connect.Response[accessv1.ListKeptDumpsResponse], error) {
+	f.saw(r.Header())
+	return connect.NewResponse(&accessv1.ListKeptDumpsResponse{Dumps: []*osadminv1.KeptDump{{
+		Name: "replaced-20261101T120000Z", Path: "/var/lib/appliance/backup/data-move/replaced-20261101T120000Z", Taken: "2026-11-01T12:00:00Z", Bytes: 3 << 20, Whole: true,
+	}}}), nil
+}
+
+func (f *resetAccessd) RemoveKeptDump(_ context.Context, r *connect.Request[accessv1.RemoveKeptDumpRequest]) (*connect.Response[accessv1.RemoveKeptDumpResponse], error) {
+	f.saw(r.Header())
+	f.removals = append(f.removals, r.Msg)
+	return connect.NewResponse(&accessv1.RemoveKeptDumpResponse{}), nil
+}
+
+func (f *resetAccessd) ReinstallProduct(_ context.Context, r *connect.Request[accessv1.ReinstallProductRequest]) (*connect.Response[accessv1.ReinstallProductResponse], error) {
+	f.saw(r.Header())
+	f.reinstalls = append(f.reinstalls, r.Msg)
+	return connect.NewResponse(&accessv1.ReinstallProductResponse{Version: "0.2.0", Source: "mirror"}), nil
+}
+
+func (f *resetAccessd) ResetProduct(_ context.Context, r *connect.Request[accessv1.ResetProductRequest]) (*connect.Response[accessv1.ResetProductResponse], error) {
+	f.saw(r.Header())
+	f.resets = append(f.resets, r.Msg)
+	return connect.NewResponse(&accessv1.ResetProductResponse{Result: &osadminv1.ResetProductResponse{
+		Product: "appliance", ProductTitle: "Appliance", Version: "0.2.0", Namespaces: 3, Objects: 41, BytesRemoved: 3 << 20, StagedVersion: "0.2.0",
+	}}), nil
+}
+
+// secretTerm is the interactive terminal: it answers each prompt in turn
+// and records whether it was read with echo.
+type secretTerm struct {
+	answers []string
+	asked   []string
+}
+
+func (s *secretTerm) Read([]byte) (int, error) { return 0, nil }
+
+func (s *secretTerm) next(kind, prompt string) (string, error) {
+	s.asked = append(s.asked, kind+" "+prompt)
+	a := s.answers[0]
+	s.answers = s.answers[1:]
+	return a, nil
+}
+
+func (s *secretTerm) AskLine(prompt string) (string, error)   { return s.next("line", prompt) }
+func (s *secretTerm) AskSecret(prompt string) (string, error) { return s.next("secret", prompt) }
+
+func resetEnv(t *testing.T, f *resetAccessd, in any) (*shell.Env, *bytes.Buffer) {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.Handle(accessv1connect.NewAccessServiceHandler(f))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	s := &shell.Services{Session: shell.Session{Admin: "alice", KeyFingerprint: "SHA256:abc", Source: "192.0.2.60"}}
+	s.UseAccessd(http.DefaultClient, srv.URL)
+	var out bytes.Buffer
+	e := &shell.Env{Origin: shell.OriginSSH, Backend: s, Out: &out, Err: &out, Product: appliance, Role: "owner"}
+	switch v := in.(type) {
+	case string:
+		e.In = strings.NewReader(v)
+	case *secretTerm:
+		e.In = v
+	}
+	return e, &out
+}
+
+// "<product> reset" reads the name and a new code, each answer from the
+// same standard input, sends both to accessd with the login's key, and
+// says what went and how to install the product again. The session's
+// product commands go with it.
+func TestTheResetCommandSendsTheNameAndANewCode(t *testing.T) {
+	f := &resetAccessd{}
+	e, out := resetEnv(t, f, "appliance\n123456\n")
+	if err := shell.Run(context.Background(), e, "appliance reset"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(f.resets) != 1 || f.resets[0].GetConfirm() != "appliance" || f.resets[0].GetTotpCode() != "123456" {
+		t.Fatalf("resets %v", f.resets)
+	}
+	if fp := f.headers[0].Get(accessapi.KeyHeader); fp != "SHA256:abc" {
+		t.Fatalf("the call carried the key %q, not the login's", fp)
+	}
+	for _, want := range []string{"can't be undone", "keeps its admins", "Type appliance", "Appliance 0.2.0 is removed: 3 namespaces and 41 objects", "3.0 MiB", "Apply the staged Appliance 0.2.0"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("no %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out.String(), "123456") {
+		t.Fatalf("the code was echoed:\n%s", out)
+	}
+	if e.Product.Present() {
+		t.Fatal("the session still offers the product's commands")
+	}
+}
+
+// On the interactive terminal the name is a prompt of its own and the code
+// is read without echo; neither enters the arrow-key recall.
+func TestTheResetCodeIsReadWithoutEcho(t *testing.T) {
+	f := &resetAccessd{}
+	term := &secretTerm{answers: []string{"box1", "654321"}}
+	e, out := resetEnv(t, f, term)
+	if err := shell.Run(context.Background(), e, "appliance reset"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(term.asked) != 2 || !strings.HasPrefix(term.asked[0], "line ") || !strings.HasPrefix(term.asked[1], "secret ") {
+		t.Fatalf("asked %v", term.asked)
+	}
+	if f.resets[0].GetConfirm() != "box1" || f.resets[0].GetTotpCode() != "654321" {
+		t.Fatalf("resets %v", f.resets)
+	}
+}
+
+// Nothing typed sends nothing.
+func TestAnUnconfirmedResetSendsNothing(t *testing.T) {
+	for _, in := range []string{"", "\n", "appliance\n\n"} {
+		f := &resetAccessd{}
+		e, out := resetEnv(t, f, in)
+		err := shell.Run(context.Background(), e, "appliance reset")
+		assertCode(t, err, "ACCESS_CONFIRM")
+		if len(f.resets) != 0 || !strings.Contains(out.String(), "nothing was removed") {
+			t.Fatalf("%q: resets %v\n%s", in, f.resets, out)
+		}
+	}
+}
+
+// The reset is an owner's, over SSH: an admin isn't offered it, the
+// console hasn't got it, and with no product there's nothing to reset.
+func TestTheResetIsAnOwnersOverSSHOnly(t *testing.T) {
+	admin := &shell.Env{Origin: shell.OriginSSH, Backend: &recordingBackend{}, Product: appliance, Role: "admin"}
+	var out bytes.Buffer
+	admin.Out, admin.Err, admin.In = &out, &out, strings.NewReader("")
+	if err := shell.Run(context.Background(), admin, "help appliance"); err != nil || strings.Contains(out.String(), "reset") {
+		t.Fatalf("an admin's help offers the reset (%v):\n%s", err, out.String())
+	}
+	if !slices.Contains(shell.NamesFor(shell.OriginSSH, appliance), "appliance reset") {
+		t.Fatal("SSH doesn't offer appliance reset")
+	}
+	if slices.Contains(shell.NamesFor(shell.OriginConsole, appliance), "appliance reset") {
+		t.Fatal("the console offers appliance reset")
+	}
+	b := &recordingBackend{}
+	console := &shell.Env{Origin: shell.OriginConsole, Backend: b, Product: appliance, Out: &out, Err: &out, In: strings.NewReader("appliance\n1\n")}
+	if err := shell.Run(context.Background(), console, "appliance reset"); err == nil || len(b.calls) != 0 {
+		t.Fatalf("the console reset: %v, calls %v", err, b.calls)
+	}
+	_, _, err := runProduct(t, productinfo.Info{}, "appliance reset")
+	assertCode(t, err, "SHELL_UNKNOWN")
+}
+
+// "<product> reinstall" reads the installed version typed and a new code,
+// sends both to accessd and says the data is kept. The product's commands
+// stay.
+func TestTheReinstallCommandSendsTheVersionAndANewCode(t *testing.T) {
+	f := &resetAccessd{}
+	e, out := resetEnv(t, f, "0.2.0\n123456\n")
+	if err := shell.Run(context.Background(), e, "appliance reinstall"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(f.reinstalls) != 1 || f.reinstalls[0].GetConfirm() != "0.2.0" || f.reinstalls[0].GetTotpCode() != "123456" {
+		t.Fatalf("reinstalls %v", f.reinstalls)
+	}
+	for _, want := range []string{"keeps its data", "Type 0.2.0", "Appliance 0.2.0 is reinstalled from the mirror"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("no %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out.String(), "123456") || !e.Product.Present() {
+		t.Fatalf("echoed the code, or dropped the product's commands:\n%s", out)
+	}
+	f = &resetAccessd{}
+	e, _ = resetEnv(t, f, "\n")
+	assertCode(t, shell.Run(context.Background(), e, "appliance reinstall"), "ACCESS_CONFIRM")
+	if len(f.reinstalls) != 0 {
+		t.Fatal("an unconfirmed reinstall was sent")
+	}
+	admin := &shell.Env{Origin: shell.OriginSSH, Backend: &recordingBackend{}, Product: appliance, Role: "admin"}
+	var help bytes.Buffer
+	admin.Out, admin.Err, admin.In = &help, &help, strings.NewReader("")
+	if err := shell.Run(context.Background(), admin, "help appliance"); err != nil || strings.Contains(help.String(), "reinstall") {
+		t.Fatalf("an admin's help offers the reinstall (%v):\n%s", err, help.String())
+	}
+}
+
+// "<product> dumps list" names each kept dump and where it is.
+func TestTheDumpsCommandListsTheKeptDumps(t *testing.T) {
+	f := &resetAccessd{}
+	e, out := resetEnv(t, f, "")
+	if err := shell.Run(context.Background(), e, "appliance dumps list"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	for _, want := range []string{"replaced-20261101T120000Z", "3.0 MiB", "/var/lib/appliance/backup/data-move/replaced-20261101T120000Z"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("no %q in:\n%s", want, out)
+		}
+	}
+}
+
+// "<product> dumps remove <name>" reads the name again and a new code, and
+// an answer that isn't the name sends nothing.
+func TestTheDumpsRemoveCommandConfirmsTheNameAndTakesANewCode(t *testing.T) {
+	const name = "replaced-20261101T120000Z"
+	f := &resetAccessd{}
+	e, out := resetEnv(t, f, name+"\n123456\n")
+	if err := shell.Run(context.Background(), e, "appliance dumps remove "+name); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(f.removals) != 1 || f.removals[0].GetName() != name || f.removals[0].GetTotpCode() != "123456" {
+		t.Fatalf("%v\n%s", f.removals, out)
+	}
+	if !strings.Contains(out.String(), "can't be undone") || strings.Contains(out.String(), "123456") {
+		t.Fatalf("%s", out)
+	}
+
+	f = &resetAccessd{}
+	e, out = resetEnv(t, f, "something-else\n123456\n")
+	if err := shell.Run(context.Background(), e, "appliance dumps remove "+name); err == nil {
+		t.Fatalf("no error:\n%s", out)
+	}
+	if len(f.removals) != 0 {
+		t.Fatalf("%v", f.removals)
+	}
+}
