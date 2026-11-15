@@ -1,0 +1,67 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"context"
+	"path/filepath"
+	"time"
+
+	log "github.com/Bugs5382/go-log"
+
+	"example.org/appliance/internal/product"
+	"example.org/appliance/internal/productreset"
+	"example.org/appliance/internal/productspec"
+	"example.org/appliance/internal/productup"
+)
+
+// productProbe asks the installed bundle's k0s how far the product has
+// come up, and brings a phased product up one phase at a time
+// (docs/upgrades.md#the-phases).
+func productProbe(c config) *productup.Probe {
+	return &productup.Probe{
+		Slot: filepath.Join(product.Dir, "current"), DataDir: "/var/lib/k0s",
+		Containerd: "/run/k0s/containerd.sock", Edge: "127.0.0.1:443",
+		SwitchDir: filepath.Join(c.state, "platform"), Manifests: "/var/lib/k0s/manifests",
+	}
+}
+
+// quiesce is the k0s service's pre-stop: the product stops latest phase
+// first, each phase's pods gone before the next, so the database stops
+// last and cleanly, before k0s itself stops on every reboot, shutdown,
+// update and revert.
+func quiesce(ctx context.Context, c config, lg log.Logger) error {
+	ctx, cancel := context.WithTimeout(ctx, productup.QuiesceBound)
+	defer cancel()
+	start := time.Now()
+	lg.Info("accessd: stopping the product in order before k0s stops")
+	if err := productProbe(c).Quiesce(ctx, time.Second); err != nil {
+		return err
+	}
+	lg.Info("accessd: the product stopped in order", log.F("seconds", int(time.Since(start).Seconds())))
+	return nil
+}
+
+// resetQuiesceBound is how long the product reset waits for the product to
+// stop in order; it isn't held to the k0s service's stop-timeout.
+const resetQuiesceBound = 10 * time.Minute
+
+// productReset removes the installed product for the closed shell's
+// "<product> reset", stopping it first with the same quiesce as the k0s
+// service's pre-stop.
+func productReset(c config, lg log.Logger) *productreset.Reset {
+	return &productreset.Reset{
+		Slot: filepath.Join(product.Dir, "current"), DataDir: "/var/lib/k0s", Manifests: "/var/lib/k0s/manifests",
+		Platform: filepath.Join(c.state, "platform"), DataRoot: productspec.DataRoot,
+		MoveDumps: moveDumps(),
+		Backups:   func() []string { return backupData(c) },
+		Images:    "/var/lib/k0s/images", Products: product.Dir,
+		Quiesce: func(ctx context.Context) error {
+			ctx, cancel := context.WithTimeout(ctx, resetQuiesceBound)
+			defer cancel()
+			return productProbe(c).Quiesce(ctx, time.Second)
+		},
+		Logger: lg,
+	}
+}

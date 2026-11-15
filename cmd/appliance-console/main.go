@@ -1,0 +1,82 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Command appliance-console is the console in normal operation,
+// information only: the status, the addresses and fingerprints, the
+// warnings, and Recover access. Init runs it as the console's owner
+// (services.d/console.yaml): its output reaches every console, the screen
+// and the serial line alike, and what's typed on any of them reaches it.
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+	// The root has no zoneinfo; the box's time zone setting is read from
+	// the copy linked in.
+	_ "time/tzdata"
+
+	log "github.com/Bugs5382/go-log"
+
+	"example.org/appliance/internal/console"
+	"example.org/appliance/internal/consoleui"
+	"example.org/appliance/internal/consoleui/dashboard"
+	"example.org/appliance/internal/consoleui/sources"
+	"example.org/appliance/internal/consoleui/tui"
+	"example.org/appliance/internal/release"
+	"example.org/appliance/internal/switchroot"
+)
+
+func main() {
+	lg := log.NewLoggerWithOptions("appliance-console", log.WithOutput(os.Stderr), log.WithDefaultFormat(log.FormatJSON), log.WithDefaultLevel(log.LevelError))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	b := sources.Dial()
+	go b.Console.Watch(ctx)
+	u := newUI()
+	d := dashboard.Deps{
+		Chrome:    consoleui.Chrome{Version: release.Version},
+		Custody:   b.Custody.Read,
+		Status:    b.Status.Read,
+		Network:   b.Network,
+		HostKeys:  func() []sources.HostKey { return sources.HostKeys(b.SSHDir) },
+		Slot:      dashboard.Slot(os.Getenv(switchroot.SourceEnv)),
+		Platform:  b.Platform,
+		Console:   b.Console,
+		AccessNet: b.AccessNet,
+		Local:     b.Local,
+		Logger:    lg,
+	}
+	lg.Info("console: started", log.F("version", release.Version), log.F("cols", u.Cols), log.F("rows", u.Rows))
+	err := dashboard.Run(ctx, u, d)
+	if errors.Is(err, tui.ErrClosed) {
+		// No console input (a box with no keyboard, say): keep showing the
+		// status, read-only.
+		lg.Warn("console: no input; the status stays on screen")
+		u.Lines = nil
+		err = dashboard.Run(ctx, u, d)
+	}
+	if err != nil && ctx.Err() == nil {
+		lg.Error(err, "console: stopped")
+		os.Exit(1)
+	}
+}
+
+// newUI is the console on standard input and output, laid out for the
+// smallest active console (the large font gives the screen 64x24), in
+// colour unless the kernel command line asks for plain.
+func newUI() *tui.UI {
+	cmdline, _ := os.ReadFile("/proc/cmdline")
+	console.FitAndLogFont("/dev", os.Stderr, "appliance-console")
+	active, _ := os.ReadFile(console.ActivePath)
+	cols, rows := console.Size("/dev", console.Names(string(active)))
+	return &tui.UI{
+		Screen: tui.NewScreen(os.Stdout, cols, rows, tui.ColourWanted(string(cmdline), os.Getenv("TERM"))),
+		Lines:  tui.ReadLines(os.Stdin),
+		Tick:   time.NewTicker(time.Second).C,
+		Cols:   cols, Rows: rows,
+	}
+}
