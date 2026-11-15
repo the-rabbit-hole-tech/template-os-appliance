@@ -1,0 +1,24 @@
+\e[37m+--------------------------------------------------------------+\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                          \e[1;37mAppliance\e[0m                           \e[37m|\e[0m
+\e[37m|\e[0m                            \e[2m0.1.0\e[0m                             \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m   \e[1;32mSetup is done. Starting Appliance.\e[0m                         \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m   The box restarts once into normal operation. The status    \e[37m|\e[0m
+\e[37m|\e[0m   screen appears when it's ready.                            \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m   \e[1;31mThe restart was refused: init isn't answering. It's\e[0m        \e[37m|\e[0m
+\e[37m|\e[0m   \e[1;31mtried again in 30 seconds.\e[0m                                 \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m+--------------------------------------------------------------+\e[0m

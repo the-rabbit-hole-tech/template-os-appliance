@@ -1,0 +1,157 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package tui draws the console's full-screen pages: a frame sized from
+// the real terminal (64x24 at the large font) with the body block centred
+// in it, written with cursor addressing and redrawn row by row so nothing
+// flickers, in colour where wanted and plain otherwise.
+// Input is line by line: the consoles stay in the kernel's line mode
+// (init joins them through pipes), which works the same on the screen and
+// on a serial line.
+package tui
+
+import (
+	"strings"
+	"unicode/utf8"
+)
+
+// Style is how a span is shown. Colour is foreground only, so a console
+// without colour, or one that drops it, still shows the same text.
+type Style uint8
+
+// The styles: a neutral, greyscale default palette in the console's 16
+// colours, with no accent hue (the base carries no logo or brand colour;
+// a product overlay may repaint the palette and docs/building.md
+// documents the override point). The frame is plain white; what needs to
+// stand out (a code, read aloud or typed) is bold white; status is
+// green, yellow and red, which are semantic, not branding; secondary
+// text is dim.
+const (
+	Normal Style = iota
+	Bold
+	OK
+	Warn
+	Alert
+	Brand
+	Accent
+	Dim
+	Strong
+)
+
+var sgr = map[Style]string{
+	Bold: "1", OK: "1;32", Warn: "1;33", Alert: "1;31",
+	Brand: "37", Accent: "1;37", Dim: "2", Strong: "1;37",
+}
+
+// Palette is the screen's 16 colours as RRGGBB, slot by slot: the UKI's
+// command line loads it into the VT (vt.default_red, _grn and _blu), so
+// the styles above show these colours instead of VGA's. Slots 3 and 4
+// (the accent and the frame, VGA's brown and blue) are white and light
+// grey in this neutral default; 9 to 11 are the bold red, green and
+// yellow, 8 the dim grey (the VT's half-bright colour) and 15 the bold
+// white. The slots no style uses keep
+// VGA's colours. A serial line keeps its terminal's own palette.
+var Palette = [16]string{
+	"000000", "AA0000", "00AA00", "FFFFFF", "C0C0C0", "AA00AA", "00AAAA", "AAAAAA",
+	"8B94A6", "F06B5F", "6FD39B", "F2C04B", "C0C0C0", "FF55FF", "55FFFF", "FFFFFF",
+}
+
+// Span is text in one style.
+type Span struct {
+	Text  string
+	Style Style
+}
+
+// Line is one row's spans.
+type Line []Span
+
+// Text is a line of plain text.
+func Text(s string) Line { return Line{{Text: s}} }
+
+// Styled is a line of text in one style.
+func Styled(st Style, s string) Line { return Line{{Text: s, Style: st}} }
+
+// String is the line's text without styles.
+func (l Line) String() string {
+	var b strings.Builder
+	for _, s := range l {
+		b.WriteString(s.Text)
+	}
+	return b.String()
+}
+
+// Len is the line's width in characters.
+func (l Line) Len() int { return utf8.RuneCountInString(l.String()) }
+
+// cut keeps the first n characters.
+func (l Line) cut(n int) Line {
+	var out Line
+	for _, s := range l {
+		if n <= 0 {
+			break
+		}
+		r := []rune(s.Text)
+		if len(r) > n {
+			r = r[:n]
+		}
+		out = append(out, Span{Text: string(r), Style: s.Style})
+		n -= len(r)
+	}
+	return out
+}
+
+func (l Line) encode(color bool) string {
+	var b strings.Builder
+	for _, s := range l {
+		if code := sgr[s.Style]; color && code != "" && s.Text != "" {
+			b.WriteString("\x1b[" + code + "m" + s.Text + "\x1b[0m")
+			continue
+		}
+		b.WriteString(s.Text)
+	}
+	return b.String()
+}
+
+// Wrap breaks text into lines of at most width characters, each starting
+// with indent. A word longer than a line is cut.
+func Wrap(text string, width int, indent string) []Line {
+	return WrapStyled(Normal, text, width, indent)
+}
+
+// WrapStyled is Wrap in one style.
+func WrapStyled(st Style, text string, width int, indent string) []Line {
+	room := width - utf8.RuneCountInString(indent)
+	if room < 10 {
+		room = 10
+	}
+	var out []Line
+	cur := ""
+	flush := func() {
+		out = append(out, Line{{Text: indent}, {Text: cur, Style: st}})
+		cur = ""
+	}
+	for _, w := range strings.Fields(text) {
+		for utf8.RuneCountInString(w) > room {
+			if cur != "" {
+				flush()
+			}
+			r := []rune(w)
+			cur = string(r[:room])
+			flush()
+			w = string(r[room:])
+		}
+		switch {
+		case cur == "":
+			cur = w
+		case utf8.RuneCountInString(cur)+1+utf8.RuneCountInString(w) <= room:
+			cur += " " + w
+		default:
+			flush()
+			cur = w
+		}
+	}
+	if cur != "" || len(out) == 0 {
+		flush()
+	}
+	return out
+}

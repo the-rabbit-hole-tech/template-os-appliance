@@ -1,0 +1,24 @@
+\e[37m+--------------------------------------------------------------+\e[0m
+\e[37m|\e[0m  \e[1;37mAppliance\e[0m\e[2m   0.1.0\e[0m                                           \e[37m|\e[0m
+\e[37m+--------------------------------------------------------------+\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m   \e[1;37mChecking the network\e[0m                                       \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m      \e[1;32m[ok]\e[0m  cable on ens192                                   \e[37m|\e[0m
+\e[37m|\e[0m      \e[1;32m[ok]\e[0m  address 192.0.2.10/24                             \e[37m|\e[0m
+\e[37m|\e[0m      \e[1;32m[ok]\e[0m  gateway 192.0.2.1                                 \e[37m|\e[0m
+\e[37m|\e[0m      \e[1;33m[!!]\e[0m  time server: no answer; certificate checks can    \e[37m|\e[0m
+\e[37m|\e[0m            fail if the clock drifts                          \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m+--------------------------------------------------------------+\e[0m
+\e[37m|\e[0m  \e[2mEnter  Done\e[0m\e[2m     \e[0m\e[2mE  Edit\e[0m\e[2m     \e[0m\e[2mQ  Leave\e[0m                        \e[37m|\e[0m
+\e[37m+--------------------------------------------------------------+\e[0m

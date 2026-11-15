@@ -1,0 +1,315 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package console_test
+
+import (
+	"bufio"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"example.org/appliance/internal/console"
+)
+
+// tty is one console: what init wrote to it, and what's typed on it.
+type tty struct {
+	mu     sync.Mutex
+	wrote  strings.Builder
+	typed  *io.PipeReader
+	typing *io.PipeWriter
+	broken bool
+}
+
+func newTTY() *tty {
+	r, w := io.Pipe()
+	return &tty{typed: r, typing: w}
+}
+
+func (t *tty) Read(p []byte) (int, error) { return t.typed.Read(p) }
+
+func (t *tty) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.broken {
+		return 0, errors.New("input/output error")
+	}
+	return t.wrote.Write(p)
+}
+
+func (t *tty) shows() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.wrote.String()
+}
+
+// waitShows waits until c shows want, and fails the test otherwise.
+func waitShows(t *testing.T, name string, c *tty, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for c.shows() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s shows %q, want %q", name, c.shows(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Every console shows what init writes: on VMware with no serial port the
+// screen is tty0, on a headless box it's ttyS0, and both show the banner
+// and the Secure Boot screen.
+func TestEveryConsoleShowsTheOutput(t *testing.T) {
+	vga, serial := newTTY(), newTTY()
+	out, outW := io.Pipe()
+	m := console.Join(out, io.Discard, []console.Console{{Name: "tty0", RW: vga}, {Name: "ttyS0", RW: serial}}, t.Logf)
+	if _, err := io.WriteString(outW, "appliance-init: phase=enrol protection=pending\n"); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]*tty{"tty0": vga, "ttyS0": serial} {
+		waitShows(t, name, c, "appliance-init: phase=enrol protection=pending\n")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !m.Idle() {
+		if time.Now().After(deadline) {
+			t.Fatal("everything is written but the mux isn't idle")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A console whose writes fail stops getting output; the others keep it.
+func TestABrokenConsoleDoesNotStopTheOthers(t *testing.T) {
+	vga, serial := newTTY(), newTTY()
+	serial.broken = true
+	out, outW := io.Pipe()
+	console.Join(out, io.Discard, []console.Console{{Name: "ttyS0", RW: serial}, {Name: "tty0", RW: vga}}, t.Logf)
+	if _, err := io.WriteString(outW, "one\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitShows(t, "tty0", vga, "one\n")
+	if _, err := io.WriteString(outW, "two\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitShows(t, "tty0", vga, "one\ntwo\n")
+}
+
+// A console that never takes its output (a stuck serial line) doesn't hold
+// up the screen.
+func TestAStuckConsoleDoesNotHoldUpTheOthers(t *testing.T) {
+	vga := newTTY()
+	stuck := &blocked{}
+	out, outW := io.Pipe()
+	console.Join(out, io.Discard, []console.Console{{Name: "ttyS0", RW: stuck}, {Name: "tty0", RW: vga}}, t.Logf)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			_, _ = io.WriteString(outW, "a line of boot output\n")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("output stopped behind the stuck console")
+	}
+}
+
+type blocked struct{}
+
+func (*blocked) Read([]byte) (int, error)  { select {} }
+func (*blocked) Write([]byte) (int, error) { select {} }
+
+// What's typed on any console reaches init, so the Secure Boot choice can
+// be answered on the screen or on the serial line.
+func TestInputFromEitherConsoleReachesInit(t *testing.T) {
+	vga, serial := newTTY(), newTTY()
+	in, inW := io.Pipe()
+	out, _ := io.Pipe()
+	console.Join(out, inW, []console.Console{{Name: "tty0", RW: vga}, {Name: "ttyS0", RW: serial}}, t.Logf)
+	lines := bufio.NewScanner(in)
+	go func() { _, _ = io.WriteString(vga.typing, "no secure boot\n") }()
+	if !lines.Scan() || lines.Text() != "no secure boot" {
+		t.Fatalf("typed on tty0, init read %q", lines.Text())
+	}
+	go func() { _, _ = io.WriteString(serial.typing, "1\n") }()
+	if !lines.Scan() || lines.Text() != "1" {
+		t.Fatalf("typed on ttyS0, init read %q", lines.Text())
+	}
+}
+
+func TestNamesReadsTheActiveList(t *testing.T) {
+	got := console.Names("tty0 ttyS0\n")
+	if strings.Join(got, ",") != "tty0,ttyS0" {
+		t.Fatalf("Names = %q", got)
+	}
+	if got := console.Names("\n"); len(got) != 0 {
+		t.Fatalf("Names of an empty list = %q", got)
+	}
+}
+
+// While a program owns the console (the dashboard, the setup wizard), what
+// everyone else writes goes aside instead of over its screen; when the
+// owner's output ends, the consoles get the shared output again.
+func TestAnOwnerHasTheConsolesToItself(t *testing.T) {
+	vga, serial := newTTY(), newTTY()
+	out, outW := io.Pipe()
+	m := console.Join(out, io.Discard, []console.Console{{Name: "tty0", RW: vga}, {Name: "ttyS0", RW: serial}}, t.Logf)
+	var aside syncBuf
+	m.SetAside(&aside)
+	owner, ownerW := io.Pipe()
+	m.Attach(owner)
+	if _, err := io.WriteString(outW, "services: started service=accessd\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(ownerW, "\x1b[H\x1b[2JAppliance appliance"); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]*tty{"tty0": vga, "ttyS0": serial} {
+		waitShows(t, name, c, "\x1b[H\x1b[2JAppliance appliance")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for aside.String() != "services: started service=accessd\n" {
+		if time.Now().After(deadline) {
+			t.Fatalf("aside holds %q", aside.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_ = ownerW.Close()
+	deadline = time.Now().Add(5 * time.Second)
+	for m.Owned() {
+		if time.Now().After(deadline) {
+			t.Fatal("still owned after the owner's output ended")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := io.WriteString(outW, "back\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitShows(t, "tty0", vga, "\x1b[H\x1b[2JAppliance appliance\x1b[0m\r\nback\n")
+}
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// The aside log keeps the newest output and a size bound.
+func TestLogFileRollsOver(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "console.log")
+	l := &console.LogFile{Path: p, Max: 16}
+	for _, s := range []string{"0123456789\n", "abcdefghij\n", "klm\n"} {
+		if _, err := io.WriteString(l, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cur, _ := os.ReadFile(p)
+	old, _ := os.ReadFile(p + ".1")
+	if string(cur) != "abcdefghij\nklm\n" || string(old) != "0123456789\n" {
+		t.Fatalf("current %q, previous %q", cur, old)
+	}
+}
+
+// The screen is a VT (tty0, tty1 ...); a serial line (ttyS0, ttyAMA0,
+// ttyUSB0) isn't.
+func TestIsScreen(t *testing.T) {
+	for name, want := range map[string]bool{"tty0": true, "tty1": true, "tty12": true, "ttyS0": false, "ttyAMA0": false, "ttyUSB0": false, "tty": false, "console": false} {
+		if got := console.IsScreen(name); got != want {
+			t.Errorf("IsScreen(%q) = %v", name, got)
+		}
+	}
+}
+
+// waitAside waits until aside holds want.
+func waitAside(t *testing.T, aside *syncBuf, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for aside.String() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("aside holds %q, want %q", aside.String(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Quiet puts a page on the screen and keeps init's and the services'
+// lines off it: they go to the serial line and the log file. Loud clears
+// the screen for init's own questions and lets the lines through again.
+func TestQuietKeepsTheLinesOffTheScreen(t *testing.T) {
+	vga, serial := newTTY(), newTTY()
+	out, outW := io.Pipe()
+	m := console.Join(out, io.Discard, []console.Console{{Name: "tty0", RW: vga}, {Name: "ttyS0", RW: serial}}, t.Logf)
+	var aside syncBuf
+	m.SetAside(&aside)
+	m.Quiet([]byte("[starting]"))
+	waitShows(t, "tty0", vga, "[starting]")
+	if _, err := io.WriteString(outW, "init: phase decided\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitShows(t, "ttyS0", serial, "init: phase decided\n")
+	waitAside(t, &aside, "init: phase decided\n")
+	if got := vga.shows(); got != "[starting]" {
+		t.Fatalf("the screen shows %q", got)
+	}
+	m.Quiet([]byte("[starting]"))
+	m.Loud()
+	if _, err := io.WriteString(outW, "Secure Boot?\n"); err != nil {
+		t.Fatal(err)
+	}
+	m.Loud()
+	if _, err := io.WriteString(outW, "Type 1 or 2\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Quiet and Loud again draw and clear nothing.
+	waitShows(t, "tty0", vga, "[starting]\x1b[0m\x1b[H\x1b[2J\x1b[?25hSecure Boot?\nType 1 or 2\n")
+	waitShows(t, "ttyS0", serial, "init: phase decided\nSecure Boot?\nType 1 or 2\n")
+}
+
+// Hold puts a page on the screen and keeps everything else off it, the
+// owner's output too: the rebooting and shutting down screens stay while
+// the services stop.
+func TestHoldKeepsEverythingOffTheScreen(t *testing.T) {
+	vga, serial := newTTY(), newTTY()
+	out, outW := io.Pipe()
+	m := console.Join(out, io.Discard, []console.Console{{Name: "tty0", RW: vga}, {Name: "ttyS0", RW: serial}}, t.Logf)
+	m.SetAside(io.Discard)
+	owner, ownerW := io.Pipe()
+	m.Attach(owner)
+	m.Hold([]byte("[rebooting]"))
+	waitShows(t, "tty0", vga, "[rebooting]")
+	if _, err := io.WriteString(ownerW, "dashboard"); err != nil {
+		t.Fatal(err)
+	}
+	waitShows(t, "ttyS0", serial, "dashboard")
+	_ = ownerW.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.Owned() {
+		if time.Now().After(deadline) {
+			t.Fatal("still owned after the owner's output ended")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := io.WriteString(outW, "power: rebooting\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitShows(t, "ttyS0", serial, "dashboard\x1b[0m\r\npower: rebooting\n")
+	if got := vga.shows(); got != "[rebooting]" {
+		t.Fatalf("the screen shows %q", got)
+	}
+}
