@@ -1,0 +1,31 @@
+# Copyright 2026 The Example Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# LAB ONLY: the lab product bundle's product.yaml (build/lab/build.sh). Two
+# phases (docs/upgrades.md#the-phases): a stand-in data phase that comes up
+# late, then the hello Deployment, so the image suite sees the box bring a
+# product up one phase at a time on its first install and after a power
+# loss, with no restarts. Like Appliance it has a setup token the box makes
+# (box_secrets) and exposes to owners and admins (`appliance setup-token`
+# over SSH), so the image suite sees a product reset make a new one for the
+# next install.
+format: 2
+exposed_values:
+  - name: setup-token
+    secret: appliance-hello/lab-setup-token
+    key: SETUP_TOKEN
+    roles: [owner, admin]
+    label: Lab setup token
+box_secrets:
+  - secret: appliance-hello/lab-setup-token
+    keys:
+      - {key: SETUP_TOKEN, generate: token}
+phases:
+  - name: data
+    label: Starting the lab's data stand-in
+    stack: lab-data
+    workloads: [lab-db]
+  - name: front
+    label: Starting the hello page
+    stack: lab-front
+    workloads: [hello]

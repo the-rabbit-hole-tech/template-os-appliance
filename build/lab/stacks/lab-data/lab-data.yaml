@@ -1,0 +1,100 @@
+# Copyright 2026 The Example Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# THROWAWAY, LAB ONLY: a stand-in for the product's data phase (PostgreSQL
+# and Valkey) in the lab product (build/lab/product.yaml). It comes up
+# late on purpose: it waits for the cluster's DNS to answer, then takes 45
+# seconds more before it's Ready, so the image suite (test/image/k0s) shows
+# the front phase (hello) starting only after it, with no restarts. Like
+# the product's database it keeps its data under /var/lib/appliance-data,
+# in lab-db/: on its first start it writes a marker there, which the
+# image suite's product reset (test/image/k0s) checks is gone after it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-db
+  namespace: appliance-hello
+  labels:
+    app: lab-db
+    appliance/phase: data
+    appliance/phase-order: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lab-db
+  template:
+    metadata:
+      labels:
+        app: lab-db
+        appliance/phase: data
+        appliance/phase-order: "1"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      # The stack tool's data-owner step (build/tools/stack): the volume's
+      # directory goes to the pod's user before the database starts.
+      initContainers:
+        - name: data-owner
+          image: docker.io/library/busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          imagePullPolicy: Never
+          command: [sh, -c, "chown 65534:65534 /data && chmod 0700 /data"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN, FOWNER]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+            limits:
+              memory: 16Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: db
+          image: docker.io/library/busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          imagePullPolicy: Never
+          command:
+            - sh
+            - -c
+            - "[ -s /data/written ] || date -u +%Y-%m-%dT%H:%M:%SZ > /data/written; until nslookup kubernetes.default.svc.cluster.local >/dev/null 2>&1; do sleep 2; done; sleep 45; touch /run/ready; exec sleep 2147483647"
+          readinessProbe:
+            exec:
+              command: [test, -f, /run/ready]
+            periodSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+            limits:
+              memory: 16Mi
+          volumeMounts:
+            - name: run
+              mountPath: /run
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: data
+          hostPath:
+            path: /var/lib/appliance-data/lab-db
+            type: DirectoryOrCreate
