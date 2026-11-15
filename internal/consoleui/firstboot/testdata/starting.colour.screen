@@ -1,0 +1,24 @@
+\e[37m+--------------------------------------------------------------+\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                          \e[1;37mAppliance\e[0m                           \e[37m|\e[0m
+\e[37m|\e[0m                            \e[2m0.1.0\e[0m                             \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m   Starting up. Leave it running.                             \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m      \e[1;32m[ok]\e[0m  system image verified                             \e[37m|\e[0m
+\e[37m|\e[0m      \e[1;32m[ok]\e[0m  encrypted data disk                               \e[37m|\e[0m
+\e[37m|\e[0m      \e[1;33m[..]\e[0m  network\e[2m   0:42\e[0m                                    \e[37m|\e[0m
+\e[37m|\e[0m      \e[2m[  ]\e[0m  setup page                                        \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m|\e[0m                                                              \e[37m|\e[0m
+\e[37m+--------------------------------------------------------------+\e[0m
