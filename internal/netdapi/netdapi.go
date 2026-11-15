@@ -1,0 +1,69 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package netdapi is what netd's callers share with it: the socket and a
+// Connect client over it. Only root peers may connect.
+package netdapi
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/netip"
+
+	"example.org/appliance/gen/go/appliance/netd/v1/netdv1connect"
+)
+
+// SocketPath is where netd listens.
+const SocketPath = "/run/appliance/netd.sock"
+
+// NewClient returns a NetworkService client over the unix socket sock.
+// It sets no overall timeout, since Watch is a long-lived stream; callers
+// bound each call with their context.
+func NewClient(sock string) netdv1connect.NetworkServiceClient {
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}}
+	return netdv1connect.NewNetworkServiceClient(hc, "http://netd.sock")
+}
+
+// Bare turns netd's management addresses (with or without a prefix
+// length) into bare addresses, the way they're shown.
+func Bare(mgmt []string) []string {
+	var out []string
+	for _, a := range addrs(mgmt) {
+		out = append(out, a.String())
+	}
+	return out
+}
+
+// Bindable turns netd's management addresses (with or without a prefix
+// length) into the addresses a listener binds, leaving out link-local
+// ones.
+func Bindable(mgmt []string) []netip.Addr {
+	var out []netip.Addr
+	for _, a := range addrs(mgmt) {
+		if !a.IsLinkLocalUnicast() {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func addrs(mgmt []string) []netip.Addr {
+	var out []netip.Addr
+	for _, m := range mgmt {
+		a, err := netip.ParseAddr(m)
+		if err != nil {
+			p, perr := netip.ParsePrefix(m)
+			if perr != nil {
+				continue
+			}
+			a = p.Addr()
+		}
+		out = append(out, a)
+	}
+	return out
+}
