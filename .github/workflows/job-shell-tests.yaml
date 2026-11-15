@@ -1,0 +1,52 @@
+name: ShellTests
+# The build scripts' own shell tests that need nothing installed: the
+# release guards (build/release), the release file names (build/lib) and the
+# lab units' input digests (build/lab/units), and that every workflow action
+# is pinned to a full commit, the DCO sign-off check and that no real
+# organisation is named in the template (build/ci). Each takes seconds, so they're
+# one job with one step each, and every step runs with `!cancelled()` so one
+# failure never hides the next.
+#
+# Pull requests only, and not while the PR is a draft. There is no rerun on
+# push to main: the PR run already checked the tree being merged (see "CI and
+# Actions minutes" in CLAUDE.md).
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  shell-tests:
+    name: Shell tests
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - name: Release guards
+        run: |
+          for t in build/release/*_test.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+      - name: Release file names
+        if: ${{ !cancelled() }}
+        run: bash build/lib/check-names_test.sh
+      - name: Lab unit input digests
+        if: ${{ !cancelled() }}
+        run: bash build/lab/units_test.sh
+      - name: Pinned actions
+        if: ${{ !cancelled() }}
+        run: bash build/ci/pinned_actions_test.sh
+      - name: DCO check
+        if: ${{ !cancelled() }}
+        run: bash build/ci/dco_test.sh
+      - name: Organisation placeholders
+        if: ${{ !cancelled() }}
+        run: bash build/ci/org_name_test.sh
