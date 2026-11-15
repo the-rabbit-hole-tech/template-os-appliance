@@ -1,0 +1,107 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package edgefall_test
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/internal/boxstate"
+	"example.org/appliance/internal/edgefall"
+)
+
+// A product that couldn't start keeps 443 on the box-state page, which
+// says so with the phase and the reason accessd gives, never a
+// half-started product.
+func TestAFailedBoxSaysWhichPhaseAndWhy(t *testing.T) {
+	w, src, _ := watcher(t)
+	src.err = nil
+	src.p = edgefall.Phase{ProductInstalled: true, ProductRunning: true, State: "failed", Step: "phase:identity",
+		Detail: "Starting sign-in, identity and the data service: appliance/appliance-data-7c9 CrashLoopBackOff"}
+	w.Poll(context.Background())
+	if w.State() != boxstate.Failed {
+		t.Fatalf("state %q", w.State())
+	}
+	if got := w.Detail(); !strings.Contains(got, "appliance-data") {
+		t.Fatalf("detail %q", got)
+	}
+	// A poll answers no detail; the pushed one holds while the box stays
+	// failed.
+	src.p.Detail, src.p.Step = "", ""
+	w.Poll(context.Background())
+	if got := w.Detail(); !strings.Contains(got, "appliance-data") {
+		t.Fatalf("detail after a poll %q", got)
+	}
+	s := edgefall.NewServer(w.State)
+	s.SetDetail(w.Detail)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin", nil))
+	body := rec.Body.String()
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get(edgefall.StateHeader) != "failed" {
+		t.Fatalf("%d %q", rec.Code, rec.Header().Get(edgefall.StateHeader))
+	}
+	if !strings.Contains(body, edgefall.WordsFor(boxstate.Failed).Title) || !strings.Contains(body, "Starting sign-in, identity and the data service: appliance/appliance-data-7c9 CrashLoopBackOff") {
+		t.Fatalf("the page: %s", body)
+	}
+	src.p = edgefall.Phase{ProductInstalled: true, ProductRunning: true, State: "starting"}
+	w.Poll(context.Background())
+	if w.Detail() != "" {
+		t.Fatalf("a starting box keeps the failure's detail %q", w.Detail())
+	}
+}
+
+// accessd's failure reason can be one long unbroken run (a pod name, a path), with no
+// spaces to wrap at; the page's own stylesheet has to let it break inside the box
+// instead of running off it.
+func TestAFailedBoxWrapsALongUnbrokenReason(t *testing.T) {
+	w, src, _ := watcher(t)
+	src.err = nil
+	reason := "phase:identity appliance/appliance-data-" + strings.Repeat("7c9", 100) + "-CrashLoopBackOff"
+	src.p = edgefall.Phase{ProductInstalled: true, ProductRunning: true, State: "failed", Step: "phase:identity", Detail: reason}
+	w.Poll(context.Background())
+	s := edgefall.NewServer(w.State)
+	s.SetDetail(w.Detail)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, reason) {
+		t.Fatalf("the page doesn't carry the exact reason: %s", body)
+	}
+	if !strings.Contains(body, "#appliance-box-detail{overflow-wrap:anywhere}") {
+		t.Fatalf("the page's stylesheet doesn't wrap the detail: %s", body)
+	}
+}
+
+// An edgefall that restarts while the box is failed has no push to go
+// on: its first ask of GetPhase gives the phase and the reason, and it
+// serves them on the page and the stream at once.
+func TestARestartedEdgefallServesTheFailureFromItsFirstAsk(t *testing.T) {
+	reason := "Starting sign-in, identity and the data service: appliance/appliance-data-7c9 CrashLoopBackOff"
+	res := &osadminv1.GetPhaseResponse{Phase: "normal", State: "failed", ProductRunning: true, ProductInstalled: true,
+		FailedPhase: "phase:identity", FailedReason: reason}
+	w := edgefall.NewWatcher(func(context.Context) (edgefall.Phase, error) { return edgefall.PhaseOf(res), nil }, t.TempDir()+"/box-state", nil)
+	w.Poll(context.Background())
+	if w.State() != boxstate.Failed || w.Detail() != reason {
+		t.Fatalf("state %q detail %q", w.State(), w.Detail())
+	}
+	if ev := w.Events().Current(); ev.State != "failed" || ev.Step != "phase:identity" || ev.Detail != reason {
+		t.Fatalf("the stream's event %+v", ev)
+	}
+	s := edgefall.NewServer(w.State)
+	s.SetDetail(w.Detail)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !strings.Contains(rec.Body.String(), reason) {
+		t.Fatalf("the page: %s", rec.Body.String())
+	}
+	// A box that isn't failed carries no reason, even if one were sent.
+	res = &osadminv1.GetPhaseResponse{Phase: "normal", State: "starting", ProductRunning: true, ProductInstalled: true, FailedReason: "stale"}
+	if p := edgefall.PhaseOf(res); p.Step != "" || p.Detail != "" {
+		t.Fatalf("a starting phase %+v", p)
+	}
+}

@@ -1,0 +1,349 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Runs poll.js on a fake clock and a fake page, and prints when it asked
+// /_box/state in each scenario, as JSON. Usage: node pollclock.js poll.js
+"use strict";
+
+const fs = require("fs");
+const vm = require("vm");
+
+const source = fs.readFileSync(process.argv[2], "utf8");
+
+function element() {
+  const e = {
+    style: {},
+    children: [],
+    attrs: {},
+    textContent: "",
+    setAttribute(k, v) { e.attrs[k] = v; },
+    hasAttribute(k) { return k in e.attrs; },
+    getAttribute(k) { return k in e.attrs ? e.attrs[k] : null; },
+    append(...c) { e.children.push(...c); },
+    addEventListener() {},
+    attachShadow() { return element(); },
+  };
+  return e;
+}
+
+// One tab: poll.js with its own clock, timers, page and box.
+function tab(seed, sse) {
+  let now = 0;
+  let timers = [];
+  let nextId = 1;
+  let rand = seed;
+  const asks = [];
+  const listeners = {};
+  const box = { state: "running", reachable: true, latency: 0, inFlight: 0, maxInFlight: 0, aborted: 0 };
+  const document = {
+    hidden: false,
+    documentElement: element(),
+    body: element(),
+    createElement: () => element(),
+    querySelector: () => null,
+    getElementById: () => null,
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+  };
+  const headers = (h) => ({ get: (k) => (h[k] === undefined ? null : h[k]) });
+  const window = {
+    location: { href: "https://box.example.org/", reload() { window.reloads++; } },
+    reloads: 0,
+    AbortController,
+    // The page's own requests and the poller's asks both come here.
+    fetch(url, opts) {
+      if (url === "/_box/state") {
+        asks.push(now);
+        if (!box.reachable) return Promise.reject(new TypeError("network"));
+        const answer = { ok: true, headers: headers({}), json: () => Promise.resolve({ state: box.state }) };
+        if (!box.latency) return Promise.resolve(answer);
+        // A slow answer: it comes after box.latency on the fake clock,
+        // unless the poller gives up on it first.
+        box.inFlight++;
+        box.maxInFlight = Math.max(box.maxInFlight, box.inFlight);
+        return new Promise((resolve, reject) => {
+          const id = ctx.setTimeout(() => { box.inFlight--; resolve(answer); }, box.latency);
+          if (opts && opts.signal) {
+            opts.signal.addEventListener("abort", () => {
+              ctx.clearTimeout(id);
+              box.inFlight--;
+              box.aborted++;
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+            });
+          }
+        });
+      }
+      const next = window.__next;
+      window.__next = null;
+      return next || Promise.resolve({ ok: true, headers: headers({}) });
+    },
+  };
+  // A fake EventSource on the same clock: box.events says whether the
+  // stream opens ("ok"), is refused ("refuse") or isn't there at all.
+  const streams = [];
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = {};
+      this.closed = false;
+      streams.push({ at: now, es: this });
+      ctx.setTimeout(() => {
+        if (this.closed) return;
+        if (box.events === "ok" && box.reachable) {
+          this.fire("open", {});
+          this.fire("state", { data: JSON.stringify({ state: box.state, seq: 1 }) });
+        } else {
+          this.fire("error", {});
+        }
+      }, 0);
+    }
+    addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); }
+    fire(type, ev) { for (const fn of this.listeners[type] || []) fn(ev); }
+    close() { this.closed = true; }
+  }
+  const live = () => streams.filter((x) => !x.es.closed).map((x) => x.es);
+  const ctx = {
+    window,
+    document,
+    AbortController,
+    fetch: (...a) => window.fetch(...a),
+    setTimeout(fn, ms) { const id = nextId++; timers.push({ id, at: now + Math.max(0, ms || 0), fn }); return id; },
+    clearTimeout(id) { timers = timers.filter((t) => t.id !== id); },
+    setInterval(fn, ms) {
+      const id = nextId++;
+      const every = () => { timers.push({ id, at: now + ms, fn: () => { every(); fn(); } }); };
+      every();
+      return id;
+    },
+    clearInterval(id) { timers = timers.filter((t) => t.id !== id); },
+    Date: { now: () => now },
+    Math: Object.assign(Object.create(Math), {
+      random() { rand = (rand * 1103515245 + 12345) % 2147483648; return rand / 2147483648; },
+    }),
+    Promise,
+    Error,
+    TypeError,
+    Object,
+  };
+  if (sse) {
+    box.events = sse;
+    window.EventSource = FakeEventSource;
+    ctx.EventSource = FakeEventSource;
+  }
+  vm.createContext(ctx);
+  const flush = () => new Promise((r) => setImmediate(r));
+  const t = {
+    box,
+    streams,
+    // An event on every open stream, as the box pushes it.
+    async push(state) {
+      for (const es of live()) es.fire("state", { data: JSON.stringify({ state, seq: 2 }) });
+      for (let i = 0; i < 5; i++) await flush();
+    },
+    // The stream drops (the box went away).
+    async drop() {
+      for (const es of live()) es.fire("error", {});
+      for (let i = 0; i < 5; i++) await flush();
+    },
+    overlay: () => document.documentElement.children.length,
+    asks,
+    document,
+    window,
+    now: () => now,
+    async start() { vm.runInContext(source, ctx); for (let i = 0; i < 5; i++) await flush(); },
+    async until(end) {
+      for (;;) {
+        timers.sort((a, b) => a.at - b.at || a.id - b.id);
+        const next = timers[0];
+        if (!next || next.at > end) break;
+        timers.shift();
+        now = next.at;
+        next.fn();
+        for (let i = 0; i < 5; i++) await flush();
+      }
+      now = end;
+    },
+    async visibility(hidden) {
+      document.hidden = hidden;
+      for (const fn of listeners.visibilitychange || []) fn();
+      for (let i = 0; i < 5; i++) await flush();
+    },
+  };
+  return t;
+}
+
+const gaps = (xs) => xs.slice(1).map((x, i) => x - xs[i]);
+const MIN = 60 * 1000;
+
+async function main() {
+  const out = {};
+
+  // Running: one ask at load, then about every 45 s.
+  {
+    const a = tab(1);
+    const b = tab(2);
+    await a.start();
+    await b.start();
+    await a.until(10 * MIN);
+    await b.until(10 * MIN);
+    out.running = { first: a.asks[0], gaps: gaps(a.asks), other: gaps(b.asks) };
+  }
+
+  // Not running: every second.
+  {
+    const a = tab(3);
+    a.box.state = "rebooting";
+    await a.start();
+    await a.until(30 * 1000);
+    out.rebooting = { gaps: gaps(a.asks) };
+  }
+
+  // Unreachable: every second.
+  {
+    const a = tab(4);
+    await a.start();
+    await a.until(MIN);
+    a.box.reachable = false;
+    const from = a.asks.length;
+    await a.until(3 * MIN);
+    out.unreachable = { gaps: gaps(a.asks.slice(from)) };
+  }
+
+  // A page request answered with Appliance-Box-State, then one that fails:
+  // each makes the poller ask at once.
+  {
+    const a = tab(5);
+    await a.start();
+    await a.until(MIN + 5000);
+    const at = a.now();
+    await callPage(a, { headers: { "Appliance-Box-State": "rebooting" } });
+    const afterHeader = a.asks.filter((x) => x >= at);
+    await a.until(at + 20 * 1000);
+    const fastWhile = gaps(a.asks.filter((x) => x >= at));
+    await a.until(at + 5 * MIN);
+    const later = gaps(a.asks.filter((x) => x >= at + 2 * MIN));
+    const at2 = a.now();
+    await callPage(a, { fail: true });
+    const afterError = a.asks.filter((x) => x >= at2);
+    out.kick = { header: afterHeader.map((x) => x - at), fastWhile, later, error: afterError.map((x) => x - at2) };
+  }
+
+  // Hidden: no asks; shown again: one at once.
+  {
+    const a = tab(6);
+    await a.start();
+    await a.until(MIN);
+    await a.visibility(true);
+    const hiddenAt = a.now();
+    await a.until(hiddenAt + 10 * MIN);
+    const whileHidden = a.asks.filter((x) => x > hiddenAt).length;
+    const shownAt = a.now();
+    await a.visibility(false);
+    const onShow = a.asks.filter((x) => x >= shownAt).map((x) => x - shownAt);
+    out.hidden = { whileHidden, onShow };
+  }
+
+  // A slow box (2.5 s an answer): no ask is given up on, and asks never
+  // overlap, while it runs or while it reboots.
+  {
+    const a = tab(7);
+    a.box.latency = 2500;
+    await a.start();
+    await a.until(5 * MIN);
+    a.box.state = "rebooting";
+    await a.until(6 * MIN);
+    out.slow = { aborted: a.box.aborted, maxInFlight: a.box.maxInFlight, asks: a.asks.length };
+  }
+
+  // An ask in flight when the tab is hidden that fails isn't the box going
+  // away: shown again, there's no overlay.
+  {
+    const a = tab(8);
+    await a.start();
+    await a.until(MIN);
+    a.box.reachable = false;
+    await a.visibility(true);
+    await a.until(2 * MIN);
+    a.box.reachable = true;
+    await a.visibility(false);
+    await a.until(2 * MIN + 5000);
+    out.thaw = { overlay: a.document.documentElement.children.length };
+  }
+
+  // The state events. While the stream is up nothing asks /_box/state
+  // after the one ask at load, and an event lays the page over at once.
+  {
+    const a = tab(9, "ok");
+    await a.start();
+    await a.until(10 * MIN);
+    const asksUp = a.asks.length;
+    const overlayBefore = a.overlay();
+    await a.push("updating");
+    const overlayNow = a.overlay();
+    out.events = { asksUp, overlayBefore, overlayNow, streams: a.streams.length };
+  }
+
+  // The stream drops while the box updates: the page stays, and the
+  // stream is tried again after 1, 2, 4, 8, 10, 10 s; when it opens on a
+  // running box the page reloads.
+  {
+    const a = tab(10, "ok");
+    await a.start();
+    await a.until(MIN);
+    await a.push("updating");
+    a.box.reachable = false;
+    const at = a.now();
+    await a.drop();
+    await a.until(at + 40 * 1000);
+    const retries = a.streams.map((x) => x.at - at).filter((x) => x >= 0);
+    const overlay = a.overlay();
+    a.box.reachable = true;
+    a.box.state = "running";
+    await a.until(at + 60 * 1000);
+    out.dropUpdating = { retries, overlay, reloads: a.window.reloads };
+  }
+
+  // The stream drops while the box runs: tried again at once; after 3
+  // failures one ask of /_box/state, which answers running, so no
+  // "can't be reached".
+  {
+    const a = tab(11, "ok");
+    await a.start();
+    await a.until(MIN);
+    const asked = a.asks.length;
+    a.box.events = "refuse";
+    const at = a.now();
+    await a.drop();
+    await a.until(at + 5000);
+    out.dropRunning = {
+      retries: a.streams.map((x) => x.at - at).filter((x) => x >= 0).slice(0, 3),
+      asks: a.asks.length - asked,
+      overlay: a.overlay(),
+    };
+  }
+
+  // A box whose stream never opens (an older edge): the slow poll every
+  // 30 to 60 seconds is the fallback.
+  {
+    const a = tab(12, "refuse");
+    await a.start();
+    await a.until(10 * MIN);
+    out.refused = { gaps: gaps(a.asks), overlay: a.overlay() };
+  }
+
+  process.stdout.write(JSON.stringify(out));
+}
+
+// callPage makes one request of the page's own through the fetch poll.js
+// may have wrapped, answered as res says.
+async function callPage(t, res) {
+  // The fake fetch underneath answers the page's request.
+  const answer = res.fail
+    ? Promise.reject(new TypeError("network"))
+    : Promise.resolve({ ok: false, status: 503, headers: { get: (k) => (res.headers[k] === undefined ? null : res.headers[k]) } });
+  answer.catch(() => {});
+  t.window.__next = answer;
+  try { await t.window.fetch("/api/graphql"); } catch (e) { void e; }
+  await t.until(t.now());
+}
+
+main().catch((e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });

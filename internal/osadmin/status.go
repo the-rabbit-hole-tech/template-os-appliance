@@ -1,0 +1,270 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osadmin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"slices"
+	"time"
+
+	"connectrpc.com/connect"
+	log "github.com/Bugs5382/go-log"
+	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	initv1 "example.org/appliance/gen/go/appliance/init/v1"
+	netdv1 "example.org/appliance/gen/go/appliance/netd/v1"
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/gen/go/appliance/osadmin/v1/osadminv1connect"
+	"example.org/appliance/internal/codes"
+	"example.org/appliance/internal/consoleui/screens"
+	"example.org/appliance/internal/keycustody"
+	"example.org/appliance/internal/netdapi"
+	netmodel "example.org/appliance/internal/network"
+	"example.org/appliance/internal/release"
+)
+
+// statusServiceTimeout bounds what GetStatus waits for each service, so one
+// that stops answering doesn't use up the caller's deadline (the console
+// gives three seconds) and leave the others looking down.
+const statusServiceTimeout = 2 * time.Second
+
+type status struct {
+	osadminv1connect.UnimplementedStatusServiceHandler
+	s *Server
+}
+
+func (h *status) GetStatus(ctx context.Context, _ *connect.Request[osadminv1.GetStatusRequest]) (*connect.Response[osadminv1.GetStatusResponse], error) {
+	s := h.s
+	cert := s.cert()
+	out := &osadminv1.GetStatusResponse{
+		Version: release.Version, Channel: release.Channel, Phase: s.Phase(),
+		TlsFingerprint: cert.Fingerprint, TlsSelfSigned: cert.SelfSigned,
+	}
+	if !cert.Expires.IsZero() {
+		out.TlsExpires = timestamppb.New(cert.Expires)
+	}
+	add := func(kind osadminv1.WarningKind, detail string) {
+		out.Warnings = append(out.Warnings, &osadminv1.Warning{Kind: kind, Detail: detail})
+	}
+	health := func(name string, err error) {
+		c := &osadminv1.Component{Name: name, Ok: err == nil}
+		if err != nil {
+			c.Detail = err.Error()
+			s.o.Logger.Warn("osadmin: status: a component didn't answer", log.F("component", name), log.F("error", err.Error()))
+		}
+		out.Health = append(out.Health, c)
+	}
+
+	netdCtx, cancelNetd := context.WithTimeout(ctx, statusServiceTimeout)
+	defer cancelNetd()
+	ns, err := s.o.Network.Status(netdCtx, connect.NewRequest(&netdv1.StatusRequest{}))
+	health("netd", err)
+	if err == nil {
+		out.Hostname, out.ManagementAddresses, out.NtpSynced = ns.Msg.GetHostname(), netdapi.Bare(ns.Msg.GetManagementAddresses()), ns.Msg.GetNtpSynced()
+		if !out.NtpSynced {
+			add(osadminv1.WarningKind_WARNING_KIND_NTP_UNSYNCED, "The clock isn't synchronised with an NTP server.")
+		}
+		if ng, gerr := s.o.Network.Get(netdCtx, connect.NewRequest(&netdv1.GetRequest{})); gerr == nil {
+			if exposed(out.ManagementAddresses, ng.Msg.GetSettings().GetAllowList()) {
+				add(osadminv1.WarningKind_WARNING_KIND_EXPOSURE, "The management interface has a public address and the allow-list lets any source reach ports 22 and 8443.")
+			}
+			out.NetworkChange = networkChange(ng.Msg)
+			switch nc := out.NetworkChange; {
+			case nc.GetPending():
+				add(osadminv1.WarningKind_WARNING_KIND_NETWORK_PENDING, fmt.Sprintf("A network change waits for its confirmation and reverts in %d seconds unless an owner confirms it on the Network page.", nc.GetRevertSecondsLeft()))
+			case nc.GetLastRevertedAtStart():
+				add(osadminv1.WarningKind_WARNING_KIND_NETWORK_REVERTED, "The last network change wasn't confirmed before the box restarted, so it was undone at start.")
+			case nc.GetLastReverted():
+				add(osadminv1.WarningKind_WARNING_KIND_NETWORK_REVERTED, "The last network change wasn't confirmed in time and was undone.")
+			}
+		}
+	}
+
+	initCtx, cancelInit := context.WithTimeout(ctx, statusServiceTimeout)
+	defer cancelInit()
+	prot, err := s.o.KeyCustody.Protection(initCtx, connect.NewRequest(&initv1.ProtectionRequest{}))
+	health("init", err)
+	if err == nil {
+		out.ProtectionReason = prot.Msg.GetReason()
+		if m, merr := s.o.KeyCustody.Mode(initCtx, connect.NewRequest(&initv1.ModeRequest{})); merr == nil {
+			switch m.Msg.GetMode() {
+			case initv1.CustodyMode_CUSTODY_MODE_TPM:
+				out.CustodyMode = "tpm"
+			case initv1.CustodyMode_CUSTODY_MODE_KEYFILE:
+				out.CustodyMode = "keyfile"
+			}
+		}
+		switch prot.Msg.GetLevel() {
+		case initv1.ProtectionLevel_PROTECTION_LEVEL_FULL:
+			out.Protection = osadminv1.Protection_PROTECTION_FULL
+			s.clearProtectionAck()
+		case initv1.ProtectionLevel_PROTECTION_LEVEL_REDUCED:
+			out.Protection = osadminv1.Protection_PROTECTION_REDUCED
+			p := keycustody.Reduced(keycustody.Reason(prot.Msg.GetReason()))
+			out.ProtectionDetail = screens.ProtectionText(p, keycustody.Mode(out.CustodyMode)) + " " + screens.RaiseText(p)
+			if out.ProtectionNotice = s.protectionNotice(prot.Msg.GetReason()); out.ProtectionNotice == nil {
+				add(osadminv1.WarningKind_WARNING_KIND_REDUCED_PROTECTION, out.ProtectionDetail)
+			}
+		}
+	}
+	imageCtx, cancelImage := context.WithTimeout(ctx, statusServiceTimeout)
+	defer cancelImage()
+	if img, ierr := s.o.Image.Status(imageCtx, connect.NewRequest(&initv1.ImageServiceStatusRequest{})); ierr == nil {
+		out.RunningVersion, out.StagedVersion, out.FailedVersion = img.Msg.GetRunningVersion(), img.Msg.GetStagedVersion(), img.Msg.GetFailedVersion()
+		out.RevertedVersion, out.RevertedBy, out.RevertedAt = img.Msg.GetRevertedVersion(), img.Msg.GetRevertedBy(), img.Msg.GetRevertedAt()
+		out.PreviousVersion, out.PreviousSlot = s.previous(img.Msg)
+		out.UpgradeProgress = s.progressToWire(img.Msg)
+	} else {
+		out.UpgradeProgress = s.progressToWire(nil)
+	}
+	productCtx, cancelProduct := context.WithTimeout(ctx, statusServiceTimeout)
+	defer cancelProduct()
+	out.Product = s.productSlots(productCtx)
+	if note := out.Product.GetResetNote(); note != "" {
+		out.Warnings = append(out.Warnings, &osadminv1.Warning{Kind: osadminv1.WarningKind_WARNING_KIND_PRODUCT_RESET_CUT_OFF, Detail: note, Critical: true})
+	}
+	if cert.SelfSigned {
+		add(osadminv1.WarningKind_WARNING_KIND_SELF_SIGNED_TLS, "This page uses the box's own self-signed certificate; check its fingerprint.")
+	}
+	tlsCtx, cancelTLS := context.WithTimeout(ctx, statusServiceTimeout)
+	defer cancelTLS()
+	out.Warnings = append(out.Warnings, s.tlsWarnings(tlsCtx)...)
+	if c, detail := s.tlsChange(); c != nil {
+		out.TlsChange = c
+		add(osadminv1.WarningKind_WARNING_KIND_TLS_CHANGED, detail)
+	}
+	if s.o.Backups != nil && s.o.Backups.Guard != nil {
+		for _, w := range s.o.Backups.Guard.Warnings() {
+			out.Warnings = append(out.Warnings, &osadminv1.Warning{Kind: osadminv1.WarningKind_WARNING_KIND_BACKUP, Detail: w.Detail, Critical: w.Critical})
+		}
+	}
+	if st := s.o.Access.Read(); st.LastRecoverAccess != nil && s.o.Clock.Now().Before(st.LastRecoverAccess.Add(24*time.Hour)) {
+		add(osadminv1.WarningKind_WARNING_KIND_CONSOLE_RECOVERY, "The console's Recover access was used at "+st.LastRecoverAccess.UTC().Format(time.RFC3339)+".")
+	}
+	if fr := s.FactoryReset(); fr != nil {
+		out.FactoryReset = fr
+		detail := "A factory reset requested by " + fr.GetStartedBy() + " is waiting for its quorum."
+		if fr.GetState() == osadminv1.FactoryResetState_FACTORY_RESET_STATE_COUNTDOWN {
+			detail = "A factory reset requested by " + fr.GetStartedBy() + " runs at " + fr.GetRunsAt().AsTime().UTC().Format(time.RFC3339) + " unless an admin cancels it."
+		}
+		add(osadminv1.WarningKind_WARNING_KIND_FACTORY_RESET, detail)
+	}
+	out.Disk = s.disk()
+	s.diskStatus(out)
+	return connect.NewResponse(out), nil
+}
+
+func exposed(mgmt, allow []string) bool {
+	var as []netip.Addr
+	for _, m := range mgmt {
+		if a, err := netip.ParseAddr(m); err == nil {
+			as = append(as, a)
+		} else if p, err := netip.ParsePrefix(m); err == nil {
+			as = append(as, p.Addr())
+		}
+	}
+	var ps []netip.Prefix
+	for _, a := range allow {
+		if p, err := netip.ParsePrefix(a); err == nil {
+			ps = append(ps, p)
+		}
+	}
+	return netmodel.Exposed(as, ps)
+}
+
+// diskSamples is one used-bytes sample per UTC day, oldest first.
+type diskSample struct {
+	Day  string `json:"day"`
+	Used uint64 `json:"used"`
+}
+
+const diskSamplesFile = "disk-samples.json"
+
+// disk reads the state volume's use and records today's sample, keeping a
+// week, so Status can show the daily growth.
+func (s *Server) disk() *osadminv1.Disk {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(s.o.Paths.State, &fs); err != nil {
+		s.o.Logger.Warn("osadmin: statfs failed", log.F("path", s.o.Paths.State), log.F("error", err.Error()))
+		return nil
+	}
+	bs := uint64(fs.Bsize) // #nosec G115 -- a block size is positive
+	total, used := fs.Blocks*bs, (fs.Blocks-fs.Bfree)*bs
+	d := &osadminv1.Disk{Path: s.o.Paths.State, UsedBytes: used, TotalBytes: total}
+	p := filepath.Join(s.o.Paths.APIDir(), diskSamplesFile)
+	var samples []diskSample
+	if b, err := os.ReadFile(p); err == nil { // #nosec G304 -- osadmin's own file
+		_ = json.Unmarshal(b, &samples)
+	}
+	today := s.o.Clock.Now().UTC().Format(time.DateOnly)
+	if i := slices.IndexFunc(samples, func(x diskSample) bool { return x.Day == today }); i < 0 {
+		samples = append(samples, diskSample{Day: today, Used: used})
+		if len(samples) > 8 {
+			samples = samples[len(samples)-8:]
+		}
+		if b, err := json.Marshal(samples); err == nil {
+			if err := os.MkdirAll(s.o.Paths.APIDir(), 0o700); err == nil {
+				if err := writeAtomic(p, b); err != nil {
+					s.o.Logger.Warn("osadmin: disk sample not saved", log.F("error", err.Error()))
+				}
+			}
+		}
+	}
+	if len(samples) >= 2 {
+		first, last := samples[0], samples[len(samples)-1]
+		t0, e0 := time.Parse(time.DateOnly, first.Day)
+		t1, e1 := time.Parse(time.DateOnly, last.Day)
+		if days := int64(t1.Sub(t0).Hours() / 24); e0 == nil && e1 == nil && days > 0 {
+			d.GrowthBytesPerDay = (int64(last.Used) - int64(first.Used)) / days // #nosec G115 -- disk sizes fit an int64
+		}
+	}
+	return d
+}
+
+func (h *status) SetSecureBoot(ctx context.Context, r *connect.Request[osadminv1.SetSecureBootRequest]) (*connect.Response[osadminv1.SetSecureBootResponse], error) {
+	c := callFrom(ctx)
+	on := "off"
+	if r.Msg.GetOn() {
+		on = "on"
+	}
+	c.note("secure-boot", "on", on)
+	if err := h.s.confirmHostname(ctx, r.Msg.GetConfirmHostname()); err != nil {
+		return nil, err
+	}
+	if _, err := h.s.o.KeyCustody.SetSecureBoot(ctx, connect.NewRequest(&initv1.SetSecureBootRequest{On: r.Msg.GetOn()})); err != nil {
+		return nil, err
+	}
+	h.s.o.Logger.Info("osadmin: Secure Boot setting changed", log.F("on", on), log.F("by", c.session.Admin))
+	return connect.NewResponse(&osadminv1.SetSecureBootResponse{}), nil
+}
+
+// confirmHostname checks a typed confirmation against the box's host name.
+func (s *Server) confirmHostname(ctx context.Context, typed string) error {
+	st, err := s.o.Network.Status(ctx, connect.NewRequest(&netdv1.StatusRequest{}))
+	if err != nil {
+		return err
+	}
+	if st.Msg.GetHostname() == "" || typed != st.Msg.GetHostname() {
+		return codes.New(codes.AccessConfirm, "type the box's host name to confirm")
+	}
+	return nil
+}
+
+// networkChange is netd's change window as Status gives it.
+func networkChange(g *netdv1.GetResponse) *osadminv1.NetworkChange {
+	nc := &osadminv1.NetworkChange{Pending: g.GetPending()}
+	if nc.Pending {
+		nc.RevertSecondsLeft, nc.ChangeId = g.GetSecondsLeft(), g.GetChangeId()
+	}
+	if l := g.GetLast(); l.GetReverted() {
+		nc.LastReverted, nc.LastRevertedAtStart, nc.LastChangeId = true, l.GetAtStart(), l.GetChangeId()
+	}
+	return nc
+}

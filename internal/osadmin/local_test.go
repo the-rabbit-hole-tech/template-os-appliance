@@ -1,0 +1,45 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osadmin_test
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/gen/go/appliance/osadmin/v1/osadminv1connect"
+	"example.org/appliance/internal/initapi"
+)
+
+// The local socket reads the caller's uid: this test process is neither
+// root nor an admin uid, so it can't cancel a factory reset, and the sign-in
+// approval of old is gone.
+func TestLocalSocketUsesThePeerUID(t *testing.T) {
+	b := newBox(t, false)
+	sock := filepath.Join(t.TempDir(), "osadmin.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: b.srv.LocalHandler(), ConnContext: initapi.PeerContext, ReadHeaderTimeout: time.Second}
+	go func() { _ = srv.Serve(initapi.PeerListener(ln, func(uint32) bool { return true }, t.Logf)) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	hc := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}}}
+	lc := osadminv1connect.NewLocalServiceClient(hc, "http://osadmin.sock")
+	ctx := context.Background()
+	_, err = lc.LocalCancelFactoryReset(ctx, connect.NewRequest(&osadminv1.LocalCancelFactoryResetRequest{}))
+	symbolIn(t, err, connect.CodePermissionDenied, "ACCESS_FORBIDDEN")
+	_, err = lc.ApproveSignIn(ctx, connect.NewRequest(&osadminv1.ApproveSignInRequest{Code: "ABCD-EFGH", Admin: "alice"}))
+	if connect.CodeOf(err) != connect.CodeUnimplemented {
+		t.Fatalf("the sign-in approval answers: %v", err)
+	}
+}

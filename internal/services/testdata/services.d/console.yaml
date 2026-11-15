@@ -1,0 +1,3 @@
+exec: /usr/libexec/appliance/console
+phases: [enrol, firstboot, normal]
+restart: always

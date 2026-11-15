@@ -1,0 +1,10 @@
+# OpenSSH sshd through appliance-sshd-run, which renders and checks its
+# config and rebinds on netd's address events. Box-issued certificates
+# only, into the closed shell, which asks for the TOTP code first. During
+# first boot accessd starts it once the first admin exists; in normal
+# operation it always runs.
+exec: /usr/bin/appliance-sshd-run
+phases: [firstboot, normal]
+on-demand-in: [firstboot]
+after: [netd, accessd]
+restart: always

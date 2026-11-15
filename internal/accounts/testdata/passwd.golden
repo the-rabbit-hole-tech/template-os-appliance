@@ -1,0 +1,8 @@
+root:x:0:0:root:/:/usr/sbin/nologin
+sshd:x:100:100:sshd privilege separation:/run/appliance/sshd-empty:/usr/sbin/nologin
+sshkeys:x:101:101:sshd keys command:/:/usr/sbin/nologin
+osadmin:x:102:102:appliance admin on 8443:/:/usr/sbin/nologin
+edgefall:x:103:103:product edge fallback on 80 and 443:/:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/:/usr/sbin/nologin
+alice:x:20000:20000:owner:/run/appliance/home/alice:/usr/bin/appliance-shell
+bob:x:20001:20001:admin:/run/appliance/home/bob:/usr/bin/appliance-shell

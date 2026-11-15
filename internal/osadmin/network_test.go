@@ -1,0 +1,369 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osadmin_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+
+	netdv1 "example.org/appliance/gen/go/appliance/netd/v1"
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+	"example.org/appliance/gen/go/appliance/osadmin/v1/osadminv1connect"
+	"example.org/appliance/internal/osaudit"
+)
+
+func TestAReloadedPageCanStillConfirm(t *testing.T) {
+	b := newBox(t, true)
+	ctx := context.Background()
+	alice := b.browser()
+	alice.signIn("alice")
+	nc := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL)
+	set := defaultSettings()
+	set.Ntp = []string{"192.0.2.123"}
+	res, err := nc.SetNetwork(ctx, connect.NewRequest(&osadminv1.SetNetworkRequest{Settings: set}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := nc.GetNetwork(ctx, connect.NewRequest(&osadminv1.GetNetworkRequest{}))
+	if err != nil || g.Msg.GetPendingToken() != res.Msg.GetToken() || g.Msg.GetPendingChangeId() != "chg-1" || g.Msg.GetRevertSecondsLeft() != 95 {
+		t.Fatalf("an owner's GetNetwork %v %v, want the token, the change and the seconds left", g, err)
+	}
+
+	bob := b.browser()
+	bob.signIn("bob")
+	bg, err := osadminv1connect.NewNetworkServiceClient(bob.hc, b.ts.URL).GetNetwork(ctx, connect.NewRequest(&osadminv1.GetNetworkRequest{}))
+	if err != nil || !bg.Msg.GetPending() || bg.Msg.GetPendingToken() != "" || bg.Msg.GetRevertSecondsLeft() != 95 {
+		t.Fatalf("an admin's GetNetwork %v %v, want pending and the seconds but no token", bg, err)
+	}
+
+	if _, err := nc.ConfirmNetwork(ctx, connect.NewRequest(&osadminv1.ConfirmNetworkRequest{Token: g.Msg.GetPendingToken()})); err != nil {
+		t.Fatal(err)
+	}
+	if e := lastEntry(t, b.log, "network.confirm"); e.Outcome != "ok" || e.Detail["change"] != "chg-1" {
+		t.Fatalf("confirm entry %+v, want the change id", e)
+	}
+	if e := lastEntry(t, b.log, "network.set"); e.Detail["change"] != "chg-1" {
+		t.Fatalf("set entry %+v, want the change id", e)
+	}
+}
+
+// Stage, review, commit: staging changes nothing, GetNetwork says what the
+// commit will do, and every step lands in the audit.
+func TestStageReviewAndCommit(t *testing.T) {
+	b := newBox(t, true)
+	ctx := context.Background()
+	alice := b.browser()
+	alice.signIn("alice")
+	nc := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL)
+	next := defaultSettings()
+	next.Management.Ipv4 = &netdv1.Ipv4{Mode: netdv1.Ipv4Mode_IPV4_MODE_STATIC, Address: "192.0.2.50/24", Gateway: "192.0.2.1"}
+	st, err := nc.StageNetwork(ctx, connect.NewRequest(&osadminv1.StageNetworkRequest{Settings: next}))
+	if err != nil || st.Msg.GetStagedId() != "stg-1" || !st.Msg.GetReview().GetMovesManagement() {
+		t.Fatalf("stage %v %v", st, err)
+	}
+	if e := lastEntry(t, b.log, "network.stage"); e.Outcome != "ok" || e.Detail["staged"] != "stg-1" {
+		t.Fatalf("stage entry %+v", e)
+	}
+	g, err := nc.GetNetwork(ctx, connect.NewRequest(&osadminv1.GetNetworkRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := g.Msg.GetStagedReview()
+	if g.Msg.GetStagedId() != "stg-1" || g.Msg.GetStaged().GetManagement().GetIpv4().GetAddress() != "192.0.2.50/24" ||
+		!r.GetMovesManagement() || r.GetNewAddress() != "192.0.2.50" || r.GetNewUrl() != "https://192.0.2.50:8443/" || !r.GetNewCertificate() || r.GetChangesAllowList() {
+		t.Fatalf("review %v", g.Msg)
+	}
+	if g.Msg.GetSettings().GetManagement().GetIpv4().GetAddress() == "192.0.2.50/24" || g.Msg.GetPending() {
+		t.Fatalf("staging changed the settings: %v", g.Msg)
+	}
+	com, err := nc.CommitNetwork(ctx, connect.NewRequest(&osadminv1.CommitNetworkRequest{StagedId: "stg-1"}))
+	if err != nil || len(com.Msg.GetTestedGateways()) != 1 || com.Msg.GetReview().GetNewAddress() != "192.0.2.50" {
+		t.Fatalf("commit %v %v", com, err)
+	}
+	if e := lastEntry(t, b.log, "network.commit"); e.Outcome != "ok" || e.Detail["staged"] != "stg-1" {
+		t.Fatalf("commit entry %+v", e)
+	}
+	g, err = nc.GetNetwork(ctx, connect.NewRequest(&osadminv1.GetNetworkRequest{}))
+	if err != nil || g.Msg.GetStagedId() != "" || g.Msg.GetStagedReview() != nil {
+		t.Fatalf("after the commit %v %v", g, err)
+	}
+}
+
+// A refused commit is a refused audit entry with the code netd gave.
+func TestACommitRefusedByNetdIsAudited(t *testing.T) {
+	b := newBox(t, true)
+	ctx := context.Background()
+	alice := b.browser()
+	alice.signIn("alice")
+	nc := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL)
+	if _, err := nc.StageNetwork(ctx, connect.NewRequest(&osadminv1.StageNetworkRequest{Settings: defaultSettings()})); err != nil {
+		t.Fatal(err)
+	}
+	b.netd.mu.Lock()
+	b.netd.commitErr = connect.NewError(connect.CodeFailedPrecondition, errors.New("NET_GATEWAY (3404): the gateway 192.0.2.1 doesn't answer"))
+	b.netd.mu.Unlock()
+	_, err := nc.CommitNetwork(ctx, connect.NewRequest(&osadminv1.CommitNetworkRequest{StagedId: "stg-1"}))
+	if !strings.Contains(fmt.Sprint(err), "NET_GATEWAY") {
+		t.Fatal(err)
+	}
+	if e := lastEntry(t, b.log, "network.commit"); e.Outcome == "ok" {
+		t.Fatalf("entry %+v", e)
+	}
+}
+
+// The commit outlives the session that asked for it: the new address drops
+// that session, and netd must still finish and the audit still say so.
+func TestACommitDoesntDieWithItsSession(t *testing.T) {
+	b := newBox(t, true)
+	alice := b.browser()
+	alice.signIn("alice")
+	nc := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := nc.StageNetwork(ctx, connect.NewRequest(&osadminv1.StageNetworkRequest{Settings: defaultSettings()})); err != nil {
+		t.Fatal(err)
+	}
+	b.netd.mu.Lock()
+	gate := make(chan struct{})
+	b.netd.commitGate = gate
+	b.netd.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = nc.CommitNetwork(ctx, connect.NewRequest(&osadminv1.CommitNetworkRequest{StagedId: "stg-1"}))
+	}()
+	b.netd.waitCommitting(t)
+	cancel()
+	<-done
+	close(gate)
+	waitFor(t, func() bool {
+		es, err := b.log.Entries()
+		return err == nil && slices.ContainsFunc(es, func(e osaudit.Entry) bool { return e.Action == "network.commit" && e.Outcome == "ok" })
+	})
+	b.netd.mu.Lock()
+	defer b.netd.mu.Unlock()
+	if b.netd.commitCtxErr != nil || b.netd.stagedID != "" {
+		t.Fatalf("commit saw %v, staged %q", b.netd.commitCtxErr, b.netd.stagedID)
+	}
+}
+
+func TestAnAdminCantStageOrCommit(t *testing.T) {
+	b := newBox(t, true)
+	ctx := context.Background()
+	bob := b.browser()
+	bob.signIn("bob")
+	nc := osadminv1connect.NewNetworkServiceClient(bob.hc, b.ts.URL)
+	if _, err := nc.StageNetwork(ctx, connect.NewRequest(&osadminv1.StageNetworkRequest{Settings: defaultSettings()})); err == nil {
+		t.Fatal("bob staged")
+	}
+	if _, err := nc.DiscardStagedNetwork(ctx, connect.NewRequest(&osadminv1.DiscardStagedNetworkRequest{})); err == nil {
+		t.Fatal("bob discarded")
+	}
+	if _, err := nc.CommitNetwork(ctx, connect.NewRequest(&osadminv1.CommitNetworkRequest{StagedId: "stg-1"})); err == nil {
+		t.Fatal("bob committed")
+	}
+}
+
+func TestApplySaysWhenTheAddressMoves(t *testing.T) {
+	cases := []struct {
+		name    string
+		change  func(*netdv1.Settings)
+		moves   bool
+		url     string
+		newCert bool
+	}{
+		{name: "dns only", change: func(s *netdv1.Settings) { s.Dns = []string{"192.0.2.53"} }},
+		{name: "host name", change: func(s *netdv1.Settings) { s.Hostname = "box2.example.org" }, newCert: true},
+		{name: "static ipv4", change: func(s *netdv1.Settings) {
+			s.Management.Ipv4 = &netdv1.Ipv4{Mode: netdv1.Ipv4Mode_IPV4_MODE_STATIC, Address: "192.0.2.20/24", Gateway: "192.0.2.1"}
+		}, moves: true, url: "https://192.0.2.20:8443/", newCert: true},
+		{name: "static ipv6", change: func(s *netdv1.Settings) {
+			s.Management.Ipv6 = &netdv1.Ipv6{Mode: netdv1.Ipv6Mode_IPV6_MODE_STATIC, Address: "2001:db8::20/64"}
+		}, moves: true, url: "https://[2001:db8::20]:8443/", newCert: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newBox(t, false)
+			alice := b.browser()
+			alice.signIn("alice")
+			alice.stepUp("alice")
+			set := defaultSettings()
+			tc.change(set)
+			res, err := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL).SetNetwork(context.Background(), connect.NewRequest(&osadminv1.SetNetworkRequest{Settings: set}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Msg.GetMovesManagement() != tc.moves || res.Msg.GetNewUrl() != tc.url || res.Msg.GetNewCertificate() != tc.newCert {
+				t.Fatalf("moves %v url %q cert %v, want %v %q %v", res.Msg.GetMovesManagement(), res.Msg.GetNewUrl(), res.Msg.GetNewCertificate(), tc.moves, tc.url, tc.newCert)
+			}
+		})
+	}
+}
+
+func TestTheRevertIsAudited(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	set := defaultSettings()
+	set.Hostname = "box2.example.org"
+	if _, err := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL).SetNetwork(context.Background(), connect.NewRequest(&osadminv1.SetNetworkRequest{Settings: set})); err != nil {
+		t.Fatal(err)
+	}
+	b.netd.revert()
+	b.clk.Advance(130 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		es, err := b.log.Entries()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range es {
+			if e.Action == "network.revert" {
+				if e.Actor != "netd" || e.Target != "network" || e.Detail["change"] != "chg-1" || e.Code != "NET_REVERTED" {
+					t.Fatalf("revert entry %+v", e)
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no network.revert entry")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The Network page says when the last change was undone because the box
+// restarted inside its window.
+func TestGetNetworkSaysAChangeWasUndoneAtStart(t *testing.T) {
+	b := newBox(t, true)
+	ctx := context.Background()
+	b.netd.mu.Lock()
+	b.netd.last = &netdv1.ChangeOutcome{ChangeId: "start-abc123", Reverted: true, AtStart: true}
+	b.netd.mu.Unlock()
+	alice := b.browser()
+	alice.signIn("alice")
+	g, err := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL).GetNetwork(ctx, connect.NewRequest(&osadminv1.GetNetworkRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := g.Msg
+	if !m.GetLastChangeReverted() || !m.GetLastChangeRevertedAtStart() || m.GetLastChangeId() != "start-abc123" {
+		t.Fatalf("last change %v %v %q", m.GetLastChangeReverted(), m.GetLastChangeRevertedAtStart(), m.GetLastChangeId())
+	}
+}
+
+// A change netd kept at once has nothing to confirm: no token, no window,
+// and no revert check later.
+func TestAChangeKeptAtOnceHasNothingToConfirm(t *testing.T) {
+	b := newBox(t, true)
+	ctx := context.Background()
+	b.netd.mu.Lock()
+	b.netd.keepAtOnce = true
+	b.netd.mu.Unlock()
+	alice := b.browser()
+	alice.signIn("alice")
+	set := defaultSettings()
+	set.Dns = []string{"192.0.2.53"}
+	res, err := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL).SetNetwork(ctx, connect.NewRequest(&osadminv1.SetNetworkRequest{Settings: set}))
+	if err != nil || res.Msg.GetToken() != "" || res.Msg.GetRevertAfterSeconds() != 0 {
+		t.Fatalf("set %v %v", res, err)
+	}
+	if e := lastEntry(t, b.log, "network.set"); e.Outcome != "ok" || e.Detail["kept"] != "at-once" {
+		t.Fatalf("set entry %+v", e)
+	}
+}
+
+// Status carries the change window, so every page (and the console) can
+// say a change waits for its confirmation, or that the last one was
+// undone.
+func TestStatusSaysANetworkChangeWaitsOrWasUndone(t *testing.T) {
+	b := newBox(t, true)
+	ctx := context.Background()
+	alice := b.browser()
+	alice.signIn("alice")
+	sc := osadminv1connect.NewStatusServiceClient(alice.hc, b.ts.URL)
+	set := defaultSettings()
+	set.AllowList = []string{"192.0.2.0/24"}
+	if _, err := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL).SetNetwork(ctx, connect.NewRequest(&osadminv1.SetNetworkRequest{Settings: set})); err != nil {
+		t.Fatal(err)
+	}
+	warned := func(st *osadminv1.GetStatusResponse, kind osadminv1.WarningKind) bool {
+		for _, w := range st.GetWarnings() {
+			if w.GetKind() == kind {
+				return true
+			}
+		}
+		return false
+	}
+	st, err := sc.GetStatus(ctx, connect.NewRequest(&osadminv1.GetStatusRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nc := st.Msg.GetNetworkChange(); !nc.GetPending() || nc.GetRevertSecondsLeft() != 95 || nc.GetChangeId() != "chg-1" || !warned(st.Msg, osadminv1.WarningKind_WARNING_KIND_NETWORK_PENDING) {
+		t.Fatalf("pending %v", st.Msg.GetNetworkChange())
+	}
+	b.netd.mu.Lock()
+	b.netd.pending = ""
+	b.netd.last = &netdv1.ChangeOutcome{ChangeId: "start-abc123", Reverted: true, AtStart: true}
+	b.netd.mu.Unlock()
+	st, err = sc.GetStatus(ctx, connect.NewRequest(&osadminv1.GetStatusRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nc := st.Msg.GetNetworkChange(); nc.GetPending() || !nc.GetLastRevertedAtStart() || !warned(st.Msg, osadminv1.WarningKind_WARNING_KIND_NETWORK_REVERTED) {
+		t.Fatalf("after the undo %v", st.Msg.GetNetworkChange())
+	}
+}
+
+// The Network page shows what DHCP gave next to the typed settings.
+func TestGetNetworkShowsWhatDHCPGave(t *testing.T) {
+	b := newBox(t, true)
+	b.netd.mu.Lock()
+	b.netd.learnt = &netdv1.StatusResponse{LearntDns: []string{"192.0.2.53"}, LearntSearch: []string{"appliance.example.org"}, LearntNtp: []string{"192.0.2.123"}, NtpServers: []string{"192.0.2.123"}}
+	b.netd.mu.Unlock()
+	alice := b.browser()
+	alice.signIn("alice")
+	g, err := osadminv1connect.NewNetworkServiceClient(alice.hc, b.ts.URL).GetNetwork(context.Background(), connect.NewRequest(&osadminv1.GetNetworkRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := g.Msg
+	if len(m.GetLearntDns()) != 1 || m.GetLearntDns()[0] != "192.0.2.53" || len(m.GetLearntSearch()) != 1 || len(m.GetLearntNtp()) != 1 || len(m.GetNtpServers()) != 1 {
+		t.Fatalf("learnt %v %v %v %v", m.GetLearntDns(), m.GetLearntSearch(), m.GetLearntNtp(), m.GetNtpServers())
+	}
+}
+
+// A netd that stops answering uses up its own deadline, not the console's
+// three seconds, so init still answers and Status marks only netd as down.
+func TestAHungNetdDoesNotMarkInitDown(t *testing.T) {
+	b := newBox(t, false)
+	alice := b.browser()
+	alice.signIn("alice")
+	b.netd.mu.Lock()
+	b.netd.hang = true
+	b.netd.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st, err := osadminv1connect.NewStatusServiceClient(alice.hc, b.ts.URL).GetStatus(ctx, connect.NewRequest(&osadminv1.GetStatusRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := map[string]bool{}
+	for _, c := range st.Msg.GetHealth() {
+		health[c.GetName()] = c.GetOk()
+	}
+	if ok, seen := health["netd"]; !seen || ok {
+		t.Fatalf("netd health %v", st.Msg.GetHealth())
+	}
+	if ok, seen := health["init"]; !seen || !ok {
+		t.Fatalf("init health %v", st.Msg.GetHealth())
+	}
+}

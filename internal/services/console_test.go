@@ -1,0 +1,210 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package services_test
+
+import (
+	"context"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	log "github.com/Bugs5382/go-log"
+
+	"example.org/appliance/internal/codes"
+	"example.org/appliance/internal/phase"
+	"example.org/appliance/internal/services"
+)
+
+// consoleRunner is a fakeRunner that can also start a program with its
+// standard output on the console's own pipe.
+type consoleRunner struct {
+	*fakeRunner
+	mu     sync.Mutex
+	stdout map[string]*os.File
+}
+
+func (r *consoleRunner) StartConsole(argv []string, stdout *os.File) (services.Process, error) {
+	r.mu.Lock()
+	r.stdout[argv[0]] = stdout
+	r.mu.Unlock()
+	return r.Start(argv)
+}
+
+// owner hands out the write end of a pipe per claim and keeps the read
+// end, as init's console does.
+type owner struct {
+	mu     sync.Mutex
+	claims int
+	reads  []*os.File
+}
+
+func (o *owner) Claim() (*os.File, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	o.mu.Lock()
+	o.claims++
+	o.reads = append(o.reads, r)
+	o.mu.Unlock()
+	return w, nil
+}
+
+// A service marked console gets the console to itself: its standard output
+// is a fresh claim on the consoles, which the supervisor closes on its own
+// side once the program has it. Other services keep the shared output.
+func TestAConsoleServiceOwnsTheConsole(t *testing.T) {
+	tbl, err := table(t, map[string]string{
+		"console": "exec: /usr/bin/appliance-console\nphases: [normal]\nconsole: true\nrestart: always\n",
+		"accessd": "exec: /usr/bin/appliance-accessd\nphases: [normal]\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &consoleRunner{fakeRunner: newRunner(), stdout: map[string]*os.File{}}
+	o := &owner{}
+	opt := opts()
+	opt.Console = o
+	s := services.NewSupervisor(r, tbl, opt)
+	if err := s.EnterPhase(context.Background(), phase.Normal); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	w, ok := r.stdout["/usr/bin/appliance-console"]
+	_, other := r.stdout["/usr/bin/appliance-accessd"]
+	r.mu.Unlock()
+	if !ok || other || o.claims != 1 {
+		t.Fatalf("console stdout %v, accessd's %v, claims %d", ok, other, o.claims)
+	}
+	if _, err := w.Write([]byte("x")); err == nil {
+		t.Fatal("the supervisor kept its copy of the console's pipe open")
+	}
+	r.proc("/usr/bin/appliance-console").crash()
+	eventually(t, "a second claim on restart", func() bool { o.mu.Lock(); defer o.mu.Unlock(); return o.claims == 2 })
+}
+
+// Without a console to claim (init kept the kernel's), a console service
+// starts like any other.
+func TestAConsoleServiceWithoutAConsole(t *testing.T) {
+	tbl, err := table(t, map[string]string{"console": "exec: /usr/bin/appliance-console\nphases: [normal]\nconsole: true\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &consoleRunner{fakeRunner: newRunner(), stdout: map[string]*os.File{}}
+	s := services.NewSupervisor(r, tbl, opts())
+	if err := s.EnterPhase(context.Background(), phase.Normal); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Running("console") || len(r.stdout) != 0 {
+		t.Fatalf("running %v, console starts %d", s.Running("console"), len(r.stdout))
+	}
+}
+
+// One program owns the console in a phase; two would fight over it.
+func TestOnlyOneConsoleServicePerPhase(t *testing.T) {
+	_, err := table(t, map[string]string{
+		"console":   "exec: /a\nphases: [firstboot, normal]\nconsole: true\n",
+		"firstboot": "exec: /b\nphases: [firstboot]\nconsole: true\n",
+	})
+	if !codes.Is(err, codes.ServiceTableInvalid) {
+		t.Fatalf("err = %v", err)
+	}
+	_, err = table(t, map[string]string{
+		"console":   "exec: /a\nphases: [normal]\nconsole: true\n",
+		"firstboot": "exec: /b\nphases: [firstboot]\nconsole: true\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = table(t, map[string]string{"console": "exec: /a\nphases: [normal]\nconsole: true\nuser: osadmin\n"})
+	if !codes.Is(err, codes.ServiceTableInvalid) {
+		t.Fatalf("a console service under a user: %v", err)
+	}
+}
+
+// The root image's console owners: the dashboard in normal, the wizard in
+// first boot, each after accessd and restarted whenever it stops.
+func TestTheRootImageConsoleOwners(t *testing.T) {
+	tbl, err := services.Load(os.DirFS("../../os/rootfs"), "services.d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, p := range map[string]phase.Phase{"console": phase.Normal, "firstboot": phase.Firstboot} {
+		s, ok := tbl[name]
+		if !ok {
+			t.Fatalf("no %s", name)
+		}
+		if !s.Console || len(s.Phases) != 1 || s.Phases[0] != p || s.Restart != services.RestartAlways || s.User != "" || s.OnDemand(p) || len(s.After) != 1 || s.After[0] != "accessd" {
+			t.Fatalf("%s: %+v", name, s)
+		}
+	}
+}
+
+// slowLog is a log output that takes a while over a "services: ready"
+// line, as a write into init's console pipe can.
+type slowLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *slowLog) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "services: ready") {
+		time.Sleep(200 * time.Millisecond)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *slowLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// seeing records what the log held when a claim on the consoles was made.
+type seeing struct {
+	owner
+	log  *slowLog
+	seen []string
+}
+
+func (o *seeing) Claim() (*os.File, error) {
+	o.mu.Lock()
+	o.seen = append(o.seen, o.log.String())
+	o.mu.Unlock()
+	return o.owner.Claim()
+}
+
+// A dependency's "services: ready" line is written before a service that
+// waits for it starts: a console service claims the consoles as it
+// starts, and a line written after the claim goes aside, off the consoles.
+func TestTheReadyLineIsWrittenBeforeADependentStarts(t *testing.T) {
+	tbl, err := table(t, map[string]string{
+		"accessd":   "exec: /usr/bin/appliance-accessd\nphases: [firstboot]\nreadiness:\n  file: /run/appliance/access.ready\n",
+		"firstboot": "exec: /usr/bin/appliance-firstboot\nphases: [firstboot]\nafter: [accessd]\nconsole: true\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &consoleRunner{fakeRunner: newRunner(), stdout: map[string]*os.File{}}
+	r.files["/run/appliance/access.ready"] = true
+	lg := &slowLog{}
+	o := &seeing{log: lg}
+	opt := opts()
+	opt.Console = o
+	opt.Logger = log.NewLoggerWithOptions("appliance-init", log.WithOutput(lg), log.WithDefaultFormat(log.FormatJSON), log.WithDefaultLevel(log.LevelInfo))
+	s := services.NewSupervisor(r, tbl, opt)
+	if err := s.EnterPhase(context.Background(), phase.Firstboot); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the console claim", func() bool { o.mu.Lock(); defer o.mu.Unlock(); return len(o.seen) == 1 })
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !strings.Contains(o.seen[0], `"services: ready"`) || !strings.Contains(o.seen[0], `"service":"accessd"`) {
+		t.Fatalf("firstboot claimed the consoles before accessd's ready line was written; the log then:\n%s", o.seen[0])
+	}
+}

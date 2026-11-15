@@ -1,0 +1,10 @@
+# The access service: the access store, sign-in codes and sessions, the OS
+# audit log, the rendered accounts and sshd files, and the backend of the
+# :8443 API on /run/appliance/access.sock. Root; init restarts it whenever it
+# stops, and logins keep working meanwhile from the files it rendered.
+exec: /usr/bin/appliance-accessd
+phases: [firstboot, normal]
+after: [netd]
+restart: always
+readiness:
+  file: /run/appliance/access.ready

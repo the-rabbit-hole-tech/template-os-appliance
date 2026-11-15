@@ -1,0 +1,106 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package accessapi is what accessd's callers share with it: the socket,
+// the headers a caller sends, the status cache it keeps for when it is
+// down, and the sentence they show then. It links no program runner, so
+// the closed shell can use it.
+package accessapi
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"google.golang.org/protobuf/encoding/protojson"
+
+	osadminv1 "example.org/appliance/gen/go/appliance/osadmin/v1"
+)
+
+// SocketPath is where accessd listens.
+const SocketPath = "/run/appliance/access.sock"
+
+// ReadyFile appears once accessd serves its socket.
+const ReadyFile = "/run/appliance/access.ready"
+
+// StatusFile is where accessd keeps the last status.
+const StatusFile = "/run/appliance/access/status.json"
+
+// SupportBundlePath is accessd's route for the closed shell's support
+// bundle, plain text as it's written (docs/support-bundle.md); ?form=full
+// asks for every section.
+const SupportBundlePath = "/support-bundle"
+
+// BackupExportPath is accessd's route for the closed shell's backup export:
+// the encrypted set as a response body, for the ticket in the query.
+const BackupExportPath = "/backup-export"
+
+// The headers a closed-shell login sends with each call. Both are only
+// for the audit entry: the identity is the peer uid, and a fingerprint
+// that isn't one of that admin's keys is refused.
+const (
+	KeyHeader    = "Appliance-Key-Fingerprint"
+	SourceHeader = "Appliance-Source"
+)
+
+// ClientHeader carries the browser's address from appliance-osadmin.
+// accessd reads it from the osadmin uid only.
+const ClientHeader = "Appliance-Client-Address"
+
+// Unavailable is what the shell and :8443 say while accessd is down.
+const Unavailable = "the appliance services are unavailable; try again shortly"
+
+// StatusCache is the last status accessd computed and when.
+type StatusCache struct {
+	Saved  time.Time
+	Status *osadminv1.GetStatusResponse
+}
+
+type cacheFile struct {
+	Saved  time.Time       `json:"saved"`
+	Status json.RawMessage `json:"status"`
+}
+
+// ReadStatusCache reads the status accessd last kept at path.
+func ReadStatusCache(path string) (StatusCache, error) {
+	b, err := os.ReadFile(path) // #nosec G304 -- the status file's fixed path
+	if err != nil {
+		return StatusCache{}, fmt.Errorf("status cache: %w", err)
+	}
+	var f cacheFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return StatusCache{}, fmt.Errorf("status cache: %w", err)
+	}
+	st := &osadminv1.GetStatusResponse{}
+	if err := protojson.Unmarshal(f.Status, st); err != nil {
+		return StatusCache{}, fmt.Errorf("status cache: %w", err)
+	}
+	return StatusCache{Saved: f.Saved, Status: st}, nil
+}
+
+// WriteStatusCache keeps st at path, readable by the shell and
+// appliance-osadmin (mode 0644): it holds what the status page shows,
+// nothing secret.
+func WriteStatusCache(path string, st *osadminv1.GetStatusResponse, saved time.Time) error {
+	raw, err := protojson.Marshal(st)
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(cacheFile{Saved: saved.UTC(), Status: raw})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { // #nosec G301 -- the shell's uid reads the cache
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil { // #nosec G306 -- status data, read by the shell and osadmin
+		return err
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil { // #nosec G302 -- as above, past the umask
+		return err
+	}
+	return os.Rename(tmp, path)
+}

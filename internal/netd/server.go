@@ -1,0 +1,206 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package netd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/netip"
+
+	"connectrpc.com/connect"
+
+	netdv1 "example.org/appliance/gen/go/appliance/netd/v1"
+	"example.org/appliance/gen/go/appliance/netd/v1/netdv1connect"
+	"example.org/appliance/internal/codes"
+	"example.org/appliance/internal/network"
+)
+
+// Handler is the NetworkService on its Connect path.
+func (d *Daemon) Handler() (string, http.Handler) {
+	return netdv1connect.NewNetworkServiceHandler(&handler{d: d})
+}
+
+type handler struct {
+	netdv1connect.UnimplementedNetworkServiceHandler
+	d *Daemon
+}
+
+// toConnect maps a coded error to a Connect error whose message starts
+// with the code's symbol.
+func toConnect(err error) error {
+	code, ok := codes.Of(err)
+	if !ok {
+		return connect.NewError(connect.CodeInternal, err)
+	}
+	c := connect.CodeFailedPrecondition
+	if code == codes.NetInvalid {
+		c = connect.CodeInvalidArgument
+	}
+	return connect.NewError(c, errors.New(codes.Describe(err)))
+}
+
+func (h *handler) Get(context.Context, *connect.Request[netdv1.GetRequest]) (*connect.Response[netdv1.GetResponse], error) {
+	s, pending := h.d.Get()
+	out := &netdv1.GetResponse{Settings: network.ToWire(s), Pending: pending}
+	if p, ok := h.d.PendingChange(); ok {
+		out.Pending, out.Token, out.ChangeId = true, p.Token, p.ID
+		out.SecondsLeft = int32(p.Left(h.d.o.Clock.Now()).Seconds())
+	}
+	if l, ok := h.d.LastChange(); ok {
+		out.Last = &netdv1.ChangeOutcome{ChangeId: l.ID, Reverted: l.Reverted, AtUnix: l.At.Unix(), AtStart: l.AtStart}
+	}
+	if st, id, ok := h.d.Staged(); ok {
+		out.Staged, out.StagedId = network.ToWire(st), id
+	}
+	return connect.NewResponse(out), nil
+}
+
+func (h *handler) Set(_ context.Context, r *connect.Request[netdv1.SetRequest]) (*connect.Response[netdv1.SetResponse], error) {
+	s, err := network.FromWire(r.Msg.GetSettings())
+	if err != nil {
+		return nil, toConnect(err)
+	}
+	if r.Msg.GetKeep() {
+		if err := h.d.SetAndKeep(s); err != nil {
+			return nil, toConnect(err)
+		}
+		return connect.NewResponse(&netdv1.SetResponse{}), nil
+	}
+	tok, err := h.d.Set(s)
+	if err != nil {
+		return nil, toConnect(err)
+	}
+	out := &netdv1.SetResponse{Token: tok}
+	if tok == "" {
+		// Kept at once: no window, nothing to confirm.
+		return connect.NewResponse(out), nil
+	}
+	out.RevertAfterSeconds = int32(network.RevertAfter.Seconds())
+	if p, ok := h.d.PendingChange(); ok && p.Token == tok {
+		out.ChangeId = p.ID
+	}
+	return connect.NewResponse(out), nil
+}
+
+func (h *handler) Confirm(_ context.Context, r *connect.Request[netdv1.ConfirmRequest]) (*connect.Response[netdv1.ConfirmResponse], error) {
+	if err := h.d.Confirm(r.Msg.GetToken()); err != nil {
+		return nil, toConnect(err)
+	}
+	return connect.NewResponse(&netdv1.ConfirmResponse{}), nil
+}
+
+func (h *handler) Stage(_ context.Context, r *connect.Request[netdv1.StageRequest]) (*connect.Response[netdv1.StageResponse], error) {
+	s, err := network.FromWire(r.Msg.GetSettings())
+	if err != nil {
+		return nil, toConnect(err)
+	}
+	id, err := h.d.Stage(s)
+	if err != nil {
+		return nil, toConnect(err)
+	}
+	return connect.NewResponse(&netdv1.StageResponse{StagedId: id}), nil
+}
+
+func (h *handler) DiscardStaged(context.Context, *connect.Request[netdv1.DiscardStagedRequest]) (*connect.Response[netdv1.DiscardStagedResponse], error) {
+	h.d.DiscardStaged()
+	return connect.NewResponse(&netdv1.DiscardStagedResponse{}), nil
+}
+
+func (h *handler) Commit(ctx context.Context, r *connect.Request[netdv1.CommitRequest]) (*connect.Response[netdv1.CommitResponse], error) {
+	tested, err := h.d.Commit(ctx, r.Msg.GetStagedId())
+	if err != nil {
+		return nil, toConnect(err)
+	}
+	return connect.NewResponse(&netdv1.CommitResponse{TestedGateways: tested}), nil
+}
+
+var checkStates = map[CheckState]netdv1.CheckState{
+	CheckOK: netdv1.CheckState_CHECK_STATE_OK, CheckWarn: netdv1.CheckState_CHECK_STATE_WARN, CheckFailed: netdv1.CheckState_CHECK_STATE_FAILED,
+}
+
+func (h *handler) Checks(ctx context.Context, _ *connect.Request[netdv1.ChecksRequest]) (*connect.Response[netdv1.ChecksResponse], error) {
+	out := &netdv1.ChecksResponse{}
+	for _, c := range h.d.Checks(ctx) {
+		out.Checks = append(out.Checks, &netdv1.Check{Name: c.Name, State: checkStates[c.State], Code: c.Code, Detail: c.Detail, Skippable: c.Skippable})
+	}
+	return connect.NewResponse(out), nil
+}
+
+func (h *handler) Status(context.Context, *connect.Request[netdv1.StatusRequest]) (*connect.Response[netdv1.StatusResponse], error) {
+	st := h.d.Status()
+	return connect.NewResponse(&netdv1.StatusResponse{
+		ManagementAddresses: st.Management, ServiceAddresses: st.Service, Hostname: st.Hostname,
+		NtpSynced: st.NTPSynced, NtpOffsetMs: st.NTPOffset.Milliseconds(), SshOpen: st.SSHOpen, HttpsOpen: st.HTTPSOpen,
+		LearntDns: addrStrings(st.LearntDNS), LearntSearch: st.LearntSearch, LearntNtp: st.LearntNTP, NtpServers: st.NTPServers,
+	}), nil
+}
+
+func (h *handler) ListInterfaces(context.Context, *connect.Request[netdv1.ListInterfacesRequest]) (*connect.Response[netdv1.ListInterfacesResponse], error) {
+	links, err := h.d.Interfaces()
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	out := &netdv1.ListInterfacesResponse{}
+	for _, l := range links {
+		out.Interfaces = append(out.Interfaces, &netdv1.Nic{Name: l.Name, Mac: l.MAC, LinkUp: l.Up, Driver: l.Driver})
+	}
+	return connect.NewResponse(out), nil
+}
+
+func (h *handler) SetManagementPorts(_ context.Context, r *connect.Request[netdv1.SetManagementPortsRequest]) (*connect.Response[netdv1.SetManagementPortsResponse], error) {
+	if err := h.d.SetManagementPorts(r.Msg.GetSsh(), r.Msg.GetHttps()); err != nil {
+		return nil, toConnect(err)
+	}
+	return connect.NewResponse(&netdv1.SetManagementPortsResponse{}), nil
+}
+
+func (h *handler) SetServicePorts(_ context.Context, r *connect.Request[netdv1.SetServicePortsRequest]) (*connect.Response[netdv1.SetServicePortsResponse], error) {
+	var rules []PortRule
+	for i, w := range r.Msg.GetRules() {
+		if w.GetPort() == 0 || w.GetPort() > 65535 {
+			return nil, toConnect(codes.Wrap(codes.NetInvalid, &network.FieldError{Field: fmt.Sprintf("rules[%d].port", i), Reason: "give a port from 1 to 65535"}))
+		}
+		pr := PortRule{Protocol: w.GetProtocol(), Port: uint16(w.GetPort())} // #nosec G115 -- checked above
+		for j, a := range w.GetAllow() {
+			p, err := netip.ParsePrefix(a)
+			if err != nil {
+				return nil, toConnect(codes.Wrap(codes.NetInvalid, &network.FieldError{Field: fmt.Sprintf("rules[%d].allow[%d]", i, j), Reason: fmt.Sprintf("%q isn't a prefix", a)}))
+			}
+			pr.Allow = append(pr.Allow, p.Masked())
+		}
+		rules = append(rules, pr)
+	}
+	if err := h.d.SetServicePorts(rules); err != nil {
+		return nil, toConnect(err)
+	}
+	return connect.NewResponse(&netdv1.SetServicePortsResponse{}), nil
+}
+
+func (h *handler) Watch(ctx context.Context, _ *connect.Request[netdv1.WatchRequest], stream *connect.ServerStream[netdv1.WatchResponse]) error {
+	ch, stop := h.d.Watch()
+	defer stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case a, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(&netdv1.WatchResponse{ManagementAddresses: a.Management, ServiceAddresses: a.Service, Hostname: a.Hostname}); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func addrStrings(in []netip.Addr) []string {
+	out := make([]string, 0, len(in))
+	for _, a := range in {
+		out = append(out, a.String())
+	}
+	return out
+}
