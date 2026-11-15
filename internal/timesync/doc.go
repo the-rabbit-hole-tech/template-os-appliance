@@ -1,0 +1,11 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package timesync is netd's client-only SNTPv4 (RFC 4330, and RFC 5905
+// section 14): a bounded sync that steps or slews the clock, periodic polls
+// after that, and a clock floor the clock is never stepped behind. It never
+// serves time.
+//
+// It takes IPv4 and IPv6 servers, up to four, including servers that come
+// from DHCPv6 option 56.
+package timesync

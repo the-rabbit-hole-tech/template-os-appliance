@@ -1,0 +1,374 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// The Status page (home).
+syntax = "proto3";
+
+package appliance.osadmin.v1;
+
+import "google/protobuf/timestamp.proto";
+import "appliance/osadmin/v1/options.proto";
+import "appliance/osadmin/v1/power.proto";
+import "appliance/osadmin/v1/upgrade.proto";
+
+option go_package = "example.org/appliance/gen/go/appliance/osadmin/v1;osadminv1";
+
+// StatusService is the box at a glance.
+service StatusService {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+    option (rule) = {role: ROLE_ADMIN};
+  }
+  // SetSecureBoot turns the Secure Boot setting off, or on again without a
+  // reinstall. The typed confirmation is the box's host name.
+  rpc SetSecureBoot(SetSecureBootRequest) returns (SetSecureBootResponse) {
+    option (rule) = {
+      role: ROLE_OWNER
+      step_up: true
+      audit: "status.secure-boot.set"
+    };
+  }
+  // GetPhase says whether the box is still in setup (firstboot) or set up
+  // (normal), and what the box is doing for the product edge's box-state
+  // page. It is public: the pages read it before anyone signs in,
+  // appliance-osadmin sends every page but /setup to /setup while setup is
+  // open, and appliance-edgefall serves the state on 443. It says nothing
+  // else about the box.
+  rpc GetPhase(GetPhaseRequest) returns (GetPhaseResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+    option (rule) = {public: true};
+  }
+  // CleanUpDisk runs the disk cleanup now (the hourly one's steps) and
+  // says what each step freed.
+  rpc CleanUpDisk(CleanUpDiskRequest) returns (CleanUpDiskResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      step_up: true
+      audit: "disk.cleanup"
+    };
+  }
+  // HideProtectionNotice hides the reduced-protection banner for the
+  // level and reason the box has now, for every admin, until either
+  // changes. reason is the protection_reason the banner was shown for;
+  // when it isn't the box's reason now, or protection is full, nothing is
+  // hidden. Status still gives the level, the reason and protection_detail.
+  rpc HideProtectionNotice(HideProtectionNoticeRequest) returns (HideProtectionNoticeResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      audit: "status.protection-notice.hide"
+    };
+  }
+}
+
+message HideProtectionNoticeRequest {
+  string reason = 1;
+}
+
+message HideProtectionNoticeResponse {
+  // hidden is false when the request's reason isn't the box's reason now
+  // (reload Status and ask again) or protection is full.
+  bool hidden = 1;
+}
+
+// ProtectionNotice says whether an admin hid the reduced-protection
+// banner for the level and reason the box has now, who and when.
+message ProtectionNotice {
+  bool hidden = 1;
+  string hidden_by = 2;
+  google.protobuf.Timestamp hidden_at = 3;
+}
+
+message CleanUpDiskRequest {}
+
+message CleanUpDiskResponse {
+  DiskCleanup cleanup = 1;
+}
+
+// DiskCleanup is one run of the disk cleanup.
+message DiskCleanup {
+  google.protobuf.Timestamp time = 1;
+  // trigger is timer (the hourly run), alert (a volume passed 80%) or
+  // admin; actor is the admin who asked, or disk-guard.
+  string trigger = 2;
+  string actor = 3;
+  uint64 freed_bytes = 4;
+  repeated DiskCleanupCategory categories = 5;
+}
+
+// DiskCleanupCategory is one step of a cleanup run: pod-logs, os-audit,
+// images, updates, tmp or wal (which only checks).
+message DiskCleanupCategory {
+  string name = 1;
+  uint64 freed_bytes = 2;
+  // note says what a step that freed nothing found; error why it failed.
+  string note = 3;
+  string error = 4;
+}
+
+// DiskLevel is a volume's alert level: a warning from 80% used, critical
+// from 90%, each clearing 5 points below where it starts.
+enum DiskLevel {
+  DISK_LEVEL_UNSPECIFIED = 0;
+  DISK_LEVEL_OK = 1;
+  DISK_LEVEL_WARNING = 2;
+  DISK_LEVEL_CRITICAL = 3;
+}
+
+// Volume is one of the box's volumes.
+message Volume {
+  // name is state, data or backup.
+  string name = 1;
+  string label = 2;
+  string path = 3;
+  uint64 used_bytes = 4;
+  // total_bytes is what's usable: used plus available.
+  uint64 total_bytes = 5;
+  double percent = 6;
+  DiskLevel level = 7;
+  // level_since is when the level began.
+  google.protobuf.Timestamp level_since = 8;
+  // shared_with names the volume this one is on when it isn't a
+  // filesystem of its own; it has no alert of its own then.
+  string shared_with = 9;
+}
+
+// DataPath is one of the product's data paths the box watches.
+message DataPath {
+  string name = 1;
+  string label = 2;
+  uint64 size_bytes = 3;
+  // growth_bytes_per_day is over the last day's hourly samples.
+  int64 growth_bytes_per_day = 4;
+  // wal_bytes is its write-ahead log's size, and wal_warn_bytes the size
+  // it shouldn't pass; both 0 when it declares none.
+  uint64 wal_bytes = 5;
+  uint64 wal_warn_bytes = 6;
+}
+
+message GetPhaseRequest {}
+
+message GetPhaseResponse {
+  // phase is firstboot until setup's Finish, then normal.
+  string phase = 1;
+  // state is what the box is doing, as the product edge's box-state page
+  // shows it: running (the product runs), starting (it doesn't run yet,
+  // or setup isn't done), rebooting, shutting-down (init has announced
+  // the reboot or the power-off), updating (an update is being applied or
+  // reverted), maintenance (an open import holds a phased product) or
+  // failed (the product failed to start; failed_phase and failed_reason
+  // say where and why).
+  string state = 2;
+  // product_running: the product's service (k0s) runs, so its edge holds
+  // 80 and 443; while it doesn't, appliance-edgefall answers there.
+  bool product_running = 3;
+  // product_installed: a product bundle is installed. Before one is,
+  // nothing answers 80 or 443.
+  bool product_installed = 4;
+  // upgrade_progress is an update's steps while one is in progress or
+  // just ended, for the restart page before anyone signs in again: the
+  // steps' ids, labels and states only, with no version, detail or code.
+  UpgradeProgress upgrade_progress = 5;
+  // failed_phase is the step a failed product stopped at, such as
+  // phase:identity, while state is failed; empty otherwise.
+  string failed_phase = 6;
+  // failed_reason is what the box-state page shows under its words while
+  // state is failed: the step's label and why, "<label>: <why>"; empty
+  // otherwise. It is the same text appliance-edgefall is pushed, so a
+  // restarted edgefall serves it from its first ask.
+  string failed_reason = 7;
+}
+
+message GetStatusRequest {}
+
+// Protection is the at-rest protection level.
+enum Protection {
+  PROTECTION_UNSPECIFIED = 0;
+  PROTECTION_FULL = 1;
+  PROTECTION_REDUCED = 2;
+}
+
+// WarningKind is one of the Status warnings.
+enum WarningKind {
+  WARNING_KIND_UNSPECIFIED = 0;
+  // WARNING_KIND_EXPOSURE: a public management address and a wide
+  // allow-list.
+  WARNING_KIND_EXPOSURE = 1;
+  // WARNING_KIND_REDUCED_PROTECTION: protection is reduced. It is left
+  // out while an admin has hidden it (HideProtectionNotice); the only
+  // warning that can be hidden.
+  WARNING_KIND_REDUCED_PROTECTION = 2;
+  WARNING_KIND_SELF_SIGNED_TLS = 3;
+  WARNING_KIND_NTP_UNSYNCED = 4;
+  // WARNING_KIND_CONSOLE_RECOVERY: a key was added through the console's
+  // Recover access and is still under its 24-hour hold.
+  WARNING_KIND_CONSOLE_RECOVERY = 5;
+  WARNING_KIND_FACTORY_RESET = 6;
+  // WARNING_KIND_SELF_APPROVED_ELEVATION: a box's only owner signed off
+  // their own elevation, and it is approved or active.
+  WARNING_KIND_SELF_APPROVED_ELEVATION = 7;
+  // WARNING_KIND_TLS_EXPIRING: an endpoint's assigned certificate expires
+  // in 30, 14 or 7 days or fewer (nothing renews it).
+  WARNING_KIND_TLS_EXPIRING = 8;
+  WARNING_KIND_TLS_EXPIRED = 9;
+  // WARNING_KIND_TLS_NAMES: an endpoint's certificate no longer covers any
+  // of the names it answers on.
+  WARNING_KIND_TLS_NAMES = 10;
+  // WARNING_KIND_NETWORK_PENDING: a network change waits for its
+  // confirmation and reverts on its own when the window ends.
+  WARNING_KIND_NETWORK_PENDING = 11;
+  // WARNING_KIND_NETWORK_REVERTED: the last network change wasn't
+  // confirmed and was undone (by the window, or at start after a reboot
+  // or an update inside it).
+  WARNING_KIND_NETWORK_REVERTED = 12;
+  // WARNING_KIND_DISK_SPACE: a volume is 80% full or more (critical from
+  // 90%).
+  WARNING_KIND_DISK_SPACE = 13;
+  // WARNING_KIND_DISK_GROWTH: a volume would fill within a week at the
+  // last day's rate.
+  WARNING_KIND_DISK_GROWTH = 14;
+  // WARNING_KIND_DATA_WAL: a product data path's write-ahead log is over
+  // the size its product.yaml declares.
+  WARNING_KIND_DATA_WAL = 15;
+  // WARNING_KIND_AUDIT_ARCHIVE: the OS audit archive is over its cap and
+  // its oldest files move to the backup volume after a day.
+  WARNING_KIND_AUDIT_ARCHIVE = 16;
+  // WARNING_KIND_TLS_CHANGED: the box replaced its own self-signed
+  // certificate, or put an earlier one back, in the last 7 days.
+  // tls_change has the details.
+  WARNING_KIND_TLS_CHANGED = 17;
+  // WARNING_KIND_PRODUCT_RESET_CUT_OFF: a product reset was cut off part-way:
+  // the box is finishing it, or the product stays stopped until it's finished.
+  WARNING_KIND_PRODUCT_RESET_CUT_OFF = 18;
+  // WARNING_KIND_BACKUP: something is wrong with the backups. The product
+  // runs on; this is degraded, never down (docs/backups.md).
+  WARNING_KIND_BACKUP = 19;
+}
+
+message Warning {
+  WarningKind kind = 1;
+  // detail is one plain sentence.
+  string detail = 2;
+  // critical marks a warning that needs action now (a volume 90% full).
+  bool critical = 3;
+}
+
+// Component is one OS-layer service osadmin talks to.
+message Component {
+  string name = 1;
+  bool ok = 2;
+  string detail = 3;
+}
+
+message Disk {
+  // path is the state volume's mount point.
+  string path = 1;
+  uint64 used_bytes = 2;
+  uint64 total_bytes = 3;
+  // growth_bytes_per_day is the average daily growth over the last week of
+  // daily samples; 0 until two days are sampled.
+  int64 growth_bytes_per_day = 4;
+}
+
+message GetStatusResponse {
+  string version = 1;
+  string channel = 2;
+  string hostname = 3;
+  // phase is firstboot or normal.
+  string phase = 4;
+  string running_version = 5;
+  string staged_version = 6;
+  // failed_version is a release boot counting fell back from: it never
+  // reached MarkGood. Empty after a manual revert.
+  string failed_version = 7;
+  Protection protection = 8;
+  // protection_reason is empty for full, else no-secure-boot-firmware,
+  // secure-boot-off or no-tpm.
+  string protection_reason = 9;
+  // custody_mode is tpm or keyfile.
+  string custody_mode = 10;
+  repeated string management_addresses = 11;
+  bool ntp_synced = 12;
+  Disk disk = 13;
+  repeated Component health = 14;
+  // tls_fingerprint is the SHA-256 of :8443's own certificate.
+  string tls_fingerprint = 15;
+  google.protobuf.Timestamp tls_expires = 16;
+  bool tls_self_signed = 17;
+  repeated Warning warnings = 18;
+  // factory_reset is set while one is pending or counting down.
+  FactoryReset factory_reset = 19;
+  // reverted_version is the newer release an admin reverted from, with who
+  // did it and when; empty when there was no manual revert.
+  string reverted_version = 20;
+  string reverted_by = 21;
+  google.protobuf.Timestamp reverted_at = 22;
+  // previous_version is the older release kept in the other slot for a
+  // revert, and previous_slot that slot, A or B (empty when the box can't
+  // tell which slot it runs from). Both are empty when there's no release
+  // to revert to.
+  string previous_version = 23;
+  string previous_slot = 24;
+  // upgrade_progress is the last stage, apply or revert, step by step;
+  // unset when the box has made none.
+  UpgradeProgress upgrade_progress = 25;
+  // product is the product bundle's slots, as GetUpgrades gives them, for
+  // the console's status screen.
+  ProductSlots product = 26;
+  // network_change is the network change that waits for its
+  // confirmation, and how the last one ended, so every page can show it.
+  NetworkChange network_change = 27;
+  // volumes are the box's volumes with their alert levels, and
+  // data_paths the product's data paths (the disk guard).
+  repeated Volume volumes = 28;
+  repeated DataPath data_paths = 29;
+  // last_cleanup is the disk cleanup's last run since accessd started.
+  DiskCleanup last_cleanup = 30;
+  // protection_detail is the reduced level in plain words with how to
+  // raise it (the reduced-protection warning's text); empty for full. It
+  // is set whether or not the notice is hidden.
+  string protection_detail = 31;
+  // protection_notice is set while the reduced-protection banner is
+  // hidden for the level and reason the box has now; Status then leaves
+  // WARNING_KIND_REDUCED_PROTECTION out of warnings.
+  ProtectionNotice protection_notice = 32;
+  // tls_change is the box's last change to its own certificate, set while
+  // WARNING_KIND_TLS_CHANGED shows, so a page can explain the browser
+  // warning an admin just saw.
+  TlsChange tls_change = 33;
+}
+
+// TlsChange is a change to the box's own self-signed certificate.
+message TlsChange {
+  google.protobuf.Timestamp at = 1;
+  // old_fingerprint and new_fingerprint are SHA-256, as tls_fingerprint.
+  string old_fingerprint = 2;
+  string new_fingerprint = 3;
+  // reason is addresses, hostname or expiring.
+  string reason = 4;
+  // restored is true when new_fingerprint is the certificate the box had
+  // before, put back because it names the box again.
+  bool restored = 5;
+}
+
+// NetworkChange is the state of the network change window.
+message NetworkChange {
+  // pending is true while a change waits for ConfirmNetwork;
+  // revert_seconds_left is how long it still waits, and change_id names it
+  // in the audit.
+  bool pending = 1;
+  int32 revert_seconds_left = 2;
+  string change_id = 3;
+  // last_reverted is true when the last change that waited was undone;
+  // last_reverted_at_start when that was because the box restarted inside
+  // its window. last_change_id names it.
+  bool last_reverted = 4;
+  bool last_reverted_at_start = 5;
+  string last_change_id = 6;
+}
+
+message SetSecureBootRequest {
+  bool on = 1;
+  string confirm_hostname = 2;
+}
+
+message SetSecureBootResponse {}

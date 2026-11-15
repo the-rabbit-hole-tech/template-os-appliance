@@ -1,0 +1,11 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use: [STANDARD]
+breaking:
+  use: [FILE]
+  # go_package is where the generated Go lands, not part of the wire format. It
+  # names the module, which the init script rewrites for every product, so a
+  # change to it is not a breaking change to anyone calling the services.
+  except: [FILE_SAME_GO_PACKAGE]

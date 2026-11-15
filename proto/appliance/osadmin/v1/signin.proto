@@ -1,0 +1,165 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// Signing in to :8443: an admin's name, password and a TOTP code, with
+// lockout and per-source throttling. Sensitive actions then ask for a
+// fresh TOTP code (StepUp).
+syntax = "proto3";
+
+package appliance.osadmin.v1;
+
+import "google/protobuf/timestamp.proto";
+import "appliance/osadmin/v1/options.proto";
+
+option go_package = "example.org/appliance/gen/go/appliance/osadmin/v1;osadminv1";
+
+// SignInService starts, refreshes and ends a browser session.
+service SignInService {
+  // SignIn checks the name, the password and a TOTP code, and sets the
+  // session cookie. A refusal carries a SignInRefusal detail: the tries
+  // left before the lockout, or when the lockout or the source's throttle
+  // ends. The same answer is given for an unknown name and a wrong
+  // password. When the caller already has a session for the same admin,
+  // that session is replaced.
+  rpc SignIn(SignInRequest) returns (SignInResponse) {
+    option (rule) = {
+      public: true
+      audit: "signin.password"
+    };
+  }
+  // StepUp takes a fresh TOTP code (one not used before) and moves the
+  // session's step_up_until 5 minutes ahead. Failures count toward the
+  // lockout like a sign-in.
+  rpc StepUp(StepUpRequest) returns (StepUpResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      audit: "signin.step-up"
+    };
+  }
+  // BeginSignIn is no longer served: SignIn replaced the sign-in code
+  // approved over SSH. It answers Not available.
+  rpc BeginSignIn(BeginSignInRequest) returns (BeginSignInResponse) {
+    option deprecated = true;
+    option (rule) = {public: true};
+  }
+  // PollSignIn is no longer served (see BeginSignIn).
+  rpc PollSignIn(PollSignInRequest) returns (PollSignInResponse) {
+    option deprecated = true;
+    option (rule) = {public: true};
+  }
+  // GetSession describes the caller's session.
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+    option (rule) = {role: ROLE_ADMIN};
+  }
+  // SignOut ends the caller's session.
+  rpc SignOut(SignOutRequest) returns (SignOutResponse) {
+    option (rule) = {
+      role: ROLE_ADMIN
+      audit: "signin.signout"
+    };
+  }
+}
+
+message SignInRequest {
+  string admin = 1;
+  string password = 2;
+  // totp_code is the 6 digits from the admin's authenticator.
+  string totp_code = 3;
+}
+
+message SignInResponse {
+  Session session = 1;
+}
+
+// SignInRefusal is the error detail of a refused sign-in, step-up, setup
+// code or SSH login, so the page can say what happens next.
+message SignInRefusal {
+  // attempts_left is the tries left before the account locks; 0 when it
+  // is locked or the source is throttled.
+  int32 attempts_left = 1;
+  // locked_until is when the account's lockout ends; unset when it isn't
+  // locked, or when only an owner can unlock it (locked_until_unlocked).
+  google.protobuf.Timestamp locked_until = 2;
+  // locked_until_unlocked: the account stays locked until an owner
+  // unlocks it (the owner's lockout setting).
+  bool locked_until_unlocked = 3;
+  // retry_after is when this source may try again; set while the source
+  // is throttled.
+  google.protobuf.Timestamp retry_after = 4;
+}
+
+message StepUpRequest {
+  string totp_code = 1;
+}
+
+message StepUpResponse {
+  Session session = 1;
+}
+
+message BeginSignInRequest {
+  option deprecated = true;
+}
+
+message BeginSignInResponse {
+  option deprecated = true;
+  string code = 1;
+  string poll_token = 2;
+  google.protobuf.Timestamp expires = 3;
+  string source_address = 4;
+  string user_agent = 5;
+}
+
+message PollSignInRequest {
+  option deprecated = true;
+  string poll_token = 1;
+}
+
+// SignInState belonged to the removed SSH-approved sign-in.
+enum SignInState {
+  option deprecated = true;
+  SIGN_IN_STATE_UNSPECIFIED = 0;
+  SIGN_IN_STATE_PENDING = 1;
+  SIGN_IN_STATE_APPROVED = 2;
+  SIGN_IN_STATE_EXPIRED = 3;
+}
+
+message PollSignInResponse {
+  option deprecated = true;
+  SignInState state = 1;
+  Session session = 2;
+}
+
+// Session is a signed-in browser.
+message Session {
+  string admin = 1;
+  Role role = 2;
+  // key_fingerprint is unused: sessions are no longer bound to an SSH key.
+  string key_fingerprint = 3 [deprecated = true];
+  google.protobuf.Timestamp signed_in = 4;
+  // step_up_until is when sensitive actions need a fresh TOTP code
+  // (StepUp) again.
+  google.protobuf.Timestamp step_up_until = 5;
+  // idle_expires moves with every call; expires is the 8-hour limit.
+  google.protobuf.Timestamp idle_expires = 6;
+  google.protobuf.Timestamp expires = 7;
+  // csrf_token goes in the X-CSRF-Token header of every call that changes
+  // something.
+  string csrf_token = 8;
+  // root_operator: the admin is on the root-operator roster and may get
+  // root-shell codes.
+  bool root_operator = 9;
+  // notices are what the admin is told once after signing in, such as a
+  // console Recover access since their last sign-in.
+  repeated string notices = 10;
+}
+
+message GetSessionRequest {}
+
+message GetSessionResponse {
+  Session session = 1;
+}
+
+message SignOutRequest {}
+
+message SignOutResponse {}

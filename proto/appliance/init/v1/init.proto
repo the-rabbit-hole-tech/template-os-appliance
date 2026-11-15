@@ -1,0 +1,303 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// The local API of appliance-init (PID 1) on /run/appliance/init.sock, served
+// with Connect (which also speaks the gRPC protocol). Root on the box may
+// connect, and the closed shell's admin logins for PowerService's reboot and
+// power-off only. Spec 1 owns the package and these services;
+// later specs add RPCs by extending them.
+syntax = "proto3";
+
+package appliance.init.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "example.org/appliance/gen/go/appliance/init/v1;initv1";
+
+// KeyCustody holds the state key and small secrets sealed under it.
+service KeyCustodyService {
+  // Initialize formats the state with the chosen custody, once, in firstboot.
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);
+  // Mode returns the custody mode fixed by Initialize.
+  rpc Mode(ModeRequest) returns (ModeResponse);
+  // Protection returns full or reduced, with the reason.
+  rpc Protection(ProtectionRequest) returns (ProtectionResponse);
+  // SetSecureBoot records the Secure Boot setting and reseals.
+  rpc SetSecureBoot(SetSecureBootRequest) returns (SetSecureBootResponse);
+  // Seal stores a small secret under the state key's protector.
+  rpc Seal(SealRequest) returns (SealResponse);
+  // Unseal returns a sealed secret.
+  rpc Unseal(UnsealRequest) returns (UnsealResponse);
+  // Escrow returns the escrow bundle encrypted to the recovery keys.
+  rpc Escrow(EscrowRequest) returns (EscrowResponse);
+}
+
+// CustodyMode is where the state key is kept.
+enum CustodyMode {
+  CUSTODY_MODE_UNSPECIFIED = 0;
+  CUSTODY_MODE_TPM = 1;
+  CUSTODY_MODE_KEYFILE = 2;
+}
+
+// SecureBootSetting is the admin's Secure Boot choice.
+enum SecureBootSetting {
+  SECURE_BOOT_SETTING_UNSPECIFIED = 0;
+  SECURE_BOOT_SETTING_ON = 1;
+  SECURE_BOOT_SETTING_OFF = 2;
+}
+
+// ProtectionLevel is what the box reports on the console and Status.
+enum ProtectionLevel {
+  PROTECTION_LEVEL_UNSPECIFIED = 0;
+  PROTECTION_LEVEL_FULL = 1;
+  PROTECTION_LEVEL_REDUCED = 2;
+}
+
+message InitializeRequest {
+  CustodyMode mode = 1;
+  SecureBootSetting secure_boot = 2;
+}
+
+message InitializeResponse {}
+
+message ModeRequest {}
+
+message ModeResponse {
+  CustodyMode mode = 1;
+}
+
+message ProtectionRequest {}
+
+message ProtectionResponse {
+  ProtectionLevel level = 1;
+  // reason is empty for full, else no-secure-boot-firmware, secure-boot-off
+  // or no-tpm.
+  string reason = 2;
+}
+
+message SetSecureBootRequest {
+  bool on = 1;
+}
+
+message SetSecureBootResponse {}
+
+message SealRequest {
+  string name = 1;
+  bytes secret = 2;
+}
+
+message SealResponse {}
+
+message UnsealRequest {
+  string name = 1;
+}
+
+message UnsealResponse {
+  bytes secret = 1;
+}
+
+message EscrowRequest {
+  // recipients are one to three ssh-ed25519 or ssh-rsa public keys.
+  repeated string recipients = 1;
+}
+
+message EscrowResponse {
+  bytes bundle = 1;
+}
+
+// Platform starts and stops k0s.
+service PlatformService {
+  rpc StartPlatform(StartPlatformRequest) returns (StartPlatformResponse);
+  rpc StopPlatform(StopPlatformRequest) returns (StopPlatformResponse);
+}
+
+message StartPlatformRequest {}
+
+message StartPlatformResponse {}
+
+message StopPlatformRequest {}
+
+message StopPlatformResponse {}
+
+// Image stages releases into the inactive slot and moves between them.
+service ImageService {
+  rpc Stage(StageRequest) returns (StageResponse);
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+  rpc MarkGood(MarkGoodRequest) returns (MarkGoodResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  rpc Status(ImageServiceStatusRequest) returns (ImageServiceStatusResponse);
+  // Unstage removes the staged release's ESP entry (UPGRADE_NOT_STAGED when
+  // none is staged), so it never boots; the slot's contents are left for
+  // the next Stage to overwrite.
+  rpc Unstage(UnstageRequest) returns (UnstageResponse);
+}
+
+message UnstageRequest {}
+
+message UnstageResponse {
+  // version is the release unstaged.
+  string version = 1;
+}
+
+message StageRequest {
+  // reference is a registry reference or a path to an OCI layout archive.
+  string reference = 1;
+  // patch is set when reference is a Base OS patch's unpacked payload: the
+  // target's layout without its root image and UKI, plus their deltas.
+  // init checks the running root slot and UKI against the base, rebuilds
+  // both blobs, checks them against the target's SHA-256, and only then
+  // stages the layout (UPGRADE_PATCH_BASE, UPGRADE_PATCH_RESULT).
+  StagePatch patch = 2;
+}
+
+// StagePatch is what a patch's signed header names, as osadmin verified it.
+message StagePatch {
+  string base_version = 1;
+  string base_root_sha256 = 2;
+  int64 base_root_size = 3;
+  string base_uki_sha256 = 4;
+  string root_sha256 = 5;
+  string uki_sha256 = 6;
+}
+
+message StageResponse {
+  string version = 1;
+  // removed_versions are the older releases the stage removed to keep the
+  // box at its release count, with their boot entries and fetched files.
+  repeated string removed_versions = 2;
+}
+
+message ActivateRequest {}
+
+message ActivateResponse {}
+
+message MarkGoodRequest {}
+
+message MarkGoodResponse {}
+
+message RollbackRequest {
+  // by is the admin who asked for the revert; it's recorded so Status
+  // reports a revert, not a failed boot.
+  string by = 1;
+}
+
+message RollbackResponse {}
+
+message ImageServiceStatusRequest {}
+
+message ImageServiceStatusResponse {
+  string running_version = 1;
+  string staged_version = 2;
+  // failed_version is a release that didn't reach MarkGood and was rolled
+  // back by boot counting. Empty after a manual revert.
+  string failed_version = 3;
+  // reverted_version is the newer release an admin reverted from (Rollback),
+  // with who asked and when; empty when there was no manual revert.
+  string reverted_version = 4;
+  string reverted_by = 5;
+  google.protobuf.Timestamp reverted_at = 6;
+  // previous_version is the older release kept for a revert: the one
+  // Rollback would boot. Empty when there's none, as after a revert or
+  // while a newer release is staged.
+  string previous_version = 7;
+  // next_stage_removes are the releases the next Stage removes to keep the
+  // box at its release count: the previous release, or a staged one.
+  repeated string next_stage_removes = 8;
+  // stage_written_bytes of stage_total_bytes is how much of a release's
+  // root image a Stage under way has written into the inactive slot; both
+  // are 0 when no Stage is writing.
+  int64 stage_written_bytes = 9;
+  int64 stage_total_bytes = 10;
+}
+
+// Power reboots, powers off or factory resets the box.
+// PowerService is answered only to osadmin and the closed shell (the peer's
+// uid and executable are checked); the factory-reset calls only to osadmin.
+service PowerService {
+  rpc Reboot(RebootRequest) returns (RebootResponse);
+  rpc PowerOff(PowerOffRequest) returns (PowerOffResponse);
+  // ArmFactoryReset tells init a factory reset's quorum has approved. Init
+  // checks the approvals against the access store's roster and starts its
+  // own delay; a reboot of init forgets it, which cancels the reset.
+  rpc ArmFactoryReset(ArmFactoryResetRequest) returns (ArmFactoryResetResponse);
+  // CancelFactoryReset forgets an armed reset.
+  rpc CancelFactoryReset(CancelFactoryResetRequest) returns (CancelFactoryResetResponse);
+  // FactoryReset runs an armed reset once init's own delay has passed, if
+  // it wasn't cancelled and hasn't expired. The request must match what
+  // was armed.
+  rpc FactoryReset(FactoryResetRequest) returns (FactoryResetResponse);
+}
+
+message RebootRequest {
+  // forced skips the graceful drain.
+  bool forced = 1;
+}
+
+message RebootResponse {}
+
+message PowerOffRequest {
+  // forced skips the graceful drain.
+  bool forced = 1;
+}
+
+message PowerOffResponse {}
+
+message ArmFactoryResetRequest {
+  // id is osadmin's request id (R-XXXXXX).
+  string id = 1;
+  string started_by = 2;
+  repeated string approvals = 3;
+}
+
+message ArmFactoryResetResponse {
+  // runs_at is the earliest time init will run the reset.
+  google.protobuf.Timestamp runs_at = 1;
+}
+
+message CancelFactoryResetRequest {
+  string id = 1;
+  // actor is who cancelled (an admin's name, or console).
+  string actor = 2;
+}
+
+message CancelFactoryResetResponse {}
+
+message FactoryResetRequest {
+  // started_by and approvals are recorded in reset.json on the ESP.
+  string started_by = 1;
+  repeated string approvals = 2;
+  // id is the armed request's id.
+  string id = 3;
+}
+
+message FactoryResetResponse {}
+
+// Services starts and stops the table's on-demand services.
+service ServicesService {
+  rpc Start(StartRequest) returns (StartResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message StartRequest {
+  string name = 1;
+}
+
+message StartResponse {}
+
+message StopRequest {
+  string name = 1;
+}
+
+message StopResponse {}
+
+message StatusRequest {
+  string name = 1;
+}
+
+message StatusResponse {
+  bool running = 1;
+  bool ready = 2;
+  int32 restarts = 3;
+  string last_error = 4;
+}
