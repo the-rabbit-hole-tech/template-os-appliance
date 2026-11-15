@@ -1,0 +1,112 @@
+drwxr-xr-x 0/0 /
+drwxr-xr-x 0/0 /bin
+-rwxr-xr-x 0/0 /bin/busybox
+lrwxrwxrwx 0/0 /bin/mount -> busybox
+lrwxrwxrwx 0/0 /bin/sh -> busybox
+lrwxrwxrwx 0/0 /bin/umount -> busybox
+drwxr-xr-x 0/0 /boot
+drwxr-xr-x 0/0 /boot/efi
+drwxr-xr-x 0/0 /dev
+drwxr-xr-x 0/0 /etc
+lrwxrwxrwx 0/0 /etc/cni -> /var/lib/cni-conf
+lrwxrwxrwx 0/0 /etc/group -> /run/appliance/accounts/group
+-rw-r--r-- 0/0 /etc/hosts
+drwxr-xr-x 0/0 /etc/k0s
+drwxr-xr-x 0/0 /etc/k0s/containerd.d
+-rw-r--r-- 0/0 /etc/k0s/containerd.toml
+-rw-r--r-- 0/0 /etc/k0s/k0s.yaml.tmpl
+lrwxrwxrwx 0/0 /etc/machine-id -> /var/lib/appliance/machine-id
+lrwxrwxrwx 0/0 /etc/passwd -> /run/appliance/accounts/passwd
+lrwxrwxrwx 0/0 /etc/resolv.conf -> /run/appliance/resolv.conf
+lrwxrwxrwx 0/0 /etc/shadow -> /run/appliance/accounts/shadow
+drwxr-xr-x 0/0 /lib
+drwxr-xr-x 0/0 /lib/modules
+lrwxrwxrwx 0/0 /opt -> /var/lib/opt
+drwxr-xr-x 0/0 /proc
+drwxr-xr-x 0/0 /run
+drwxr-xr-x 0/0 /sbin
+lrwxrwxrwx 0/0 /sbin/halt -> /usr/libexec/appliance/appliance-hvpower
+-rwxr-xr-x 0/0 /sbin/init
+lrwxrwxrwx 0/0 /sbin/poweroff -> /usr/libexec/appliance/appliance-hvpower
+lrwxrwxrwx 0/0 /sbin/reboot -> /usr/libexec/appliance/appliance-hvpower
+drwxr-xr-x 0/0 /sys
+drwxr-xr-x 0/0 /tmp
+drwxr-xr-x 0/0 /usr
+drwxr-xr-x 0/0 /usr/bin
+lrwxrwxrwx 0/0 /usr/bin/helm -> /var/lib/appliance/product/current/helm
+lrwxrwxrwx 0/0 /usr/bin/kubectl -> /var/lib/appliance/product/current/k0s
+-rwxr-xr-x 0/0 /usr/bin/qemu-ga
+-rwxr-xr-x 0/0 /usr/bin/appliance-accessd
+-rwxr-xr-x 0/0 /usr/bin/appliance-console
+-rwxr-xr-x 0/0 /usr/bin/appliance-edgefall
+-rwxr-xr-x 0/0 /usr/bin/appliance-firstboot
+-rwxr-xr-x 0/0 /usr/bin/appliance-netd
+-rwxr-xr-x 0/0 /usr/bin/appliance-osadmin
+-rwxr-xr-x 0/0 /usr/bin/appliance-shell
+-rwxr-xr-x 0/0 /usr/bin/appliance-sshd-run
+-rwxr-xr-x 0/0 /usr/bin/ssh-keygen
+-rwxr-xr-x 0/0 /usr/bin/watch
+drwxr-xr-x 0/0 /usr/lib
+drwxr-xr-x 0/0 /usr/lib/appliance
+drwxr-xr-x 0/0 /usr/lib/appliance/services.d
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/accessd.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/console.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/edgefall.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/firstboot.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/k0s.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/netd.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/osadmin.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/qemu-ga.yaml
+-rw-r--r-- 0/0 /usr/lib/appliance/services.d/sshd.yaml
+drwxr-xr-x 0/0 /usr/libexec
+drwxr-xr-x 0/0 /usr/libexec/k0s
+drwxr-xr-x 0/0 /usr/libexec/k0s/kubelet-plugins
+drwxr-xr-x 0/0 /usr/libexec/k0s/kubelet-plugins/volume
+drwxr-xr-x 0/0 /usr/libexec/k0s/kubelet-plugins/volume/exec
+drwxr-xr-x 0/0 /usr/libexec/openssh
+-rwxr-xr-x 0/0 /usr/libexec/openssh/sshd-auth
+-rwxr-xr-x 0/0 /usr/libexec/openssh/sshd-session
+drwxr-xr-x 0/0 /usr/libexec/appliance
+-rwxr-xr-x 0/0 /usr/libexec/appliance-elevated
+-rwxr-xr-x 0/0 /usr/libexec/appliance/k0s-interim
+-rwxr-xr-x 0/0 /usr/libexec/appliance/appliance-hvpower
+drwxr-xr-x 0/0 /usr/sbin
+-rwxr-xr-x 0/0 /usr/sbin/cryptsetup
+-rwxr-xr-x 0/0 /usr/sbin/mkfs.ext4
+-rwxr-xr-x 0/0 /usr/sbin/sgdisk
+-rwxr-xr-x 0/0 /usr/sbin/sshd
+-rwxr-xr-x 0/0 /usr/sbin/veritysetup
+drwxr-xr-x 0/0 /usr/share
+drwxr-xr-x 0/0 /usr/share/appliance
+drwxr-xr-x 0/0 /usr/share/appliance/charts
+drwxr-xr-x 0/0 /usr/share/appliance/osadmin
+drwxr-xr-x 0/0 /usr/share/appliance/release
+-rw-r--r-- 0/0 /usr/share/appliance/release/release.yaml
+drwxr-xr-x 0/0 /usr/share/terminfo
+drwxr-xr-x 0/0 /usr/share/terminfo/a
+-rw-r--r-- 0/0 /usr/share/terminfo/a/ansi
+drwxr-xr-x 0/0 /usr/share/terminfo/d
+-rw-r--r-- 0/0 /usr/share/terminfo/d/dumb
+drwxr-xr-x 0/0 /usr/share/terminfo/l
+-rw-r--r-- 0/0 /usr/share/terminfo/l/linux
+drwxr-xr-x 0/0 /usr/share/terminfo/p
+-rw-r--r-- 0/0 /usr/share/terminfo/p/putty
+-rw-r--r-- 0/0 /usr/share/terminfo/p/putty-256color
+drwxr-xr-x 0/0 /usr/share/terminfo/s
+-rw-r--r-- 0/0 /usr/share/terminfo/s/screen
+-rw-r--r-- 0/0 /usr/share/terminfo/s/screen-256color
+drwxr-xr-x 0/0 /usr/share/terminfo/t
+-rw-r--r-- 0/0 /usr/share/terminfo/t/tmux
+-rw-r--r-- 0/0 /usr/share/terminfo/t/tmux-256color
+drwxr-xr-x 0/0 /usr/share/terminfo/v
+-rw-r--r-- 0/0 /usr/share/terminfo/v/vt100
+-rw-r--r-- 0/0 /usr/share/terminfo/v/vt102
+-rw-r--r-- 0/0 /usr/share/terminfo/v/vt220
+drwxr-xr-x 0/0 /usr/share/terminfo/x
+-rw-r--r-- 0/0 /usr/share/terminfo/x/xterm
+-rw-r--r-- 0/0 /usr/share/terminfo/x/xterm-256color
+-rw-r--r-- 0/0 /usr/share/terminfo/x/xterm-color
+drwxr-xr-x 0/0 /var
+drwxr-xr-x 0/0 /var/lib
+lrwxrwxrwx 0/0 /var/log -> /var/lib/log
+lrwxrwxrwx 0/0 /var/run -> /run
