@@ -1,0 +1,125 @@
+// Copyright 2026 The Example Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package osaudit_test
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"example.org/appliance/internal/osaudit"
+)
+
+func writeN(t *testing.T, r *osaudit.Recorder, n int) {
+	t.Helper()
+	line := []byte(strings.Repeat("x", 1000) + "\r\n")
+	for written := 0; written < n; written += len(line) {
+		if _, err := r.Write(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRecordingPrefixVerifiable(t *testing.T) {
+	l := openLog(t)
+	var buf bytes.Buffer
+	r := osaudit.NewRecorder(&buf, l, "E-7K2Q", "alice")
+	writeN(t, r, 200*1024) // three full chunks and a partial
+	// no Close: the session was killed
+	mustNoErr(t, osaudit.VerifyRecording(buf.Bytes(), l, "E-7K2Q"))
+	covered, err := osaudit.VerifyRecordingPrefix(buf.Bytes(), l, "E-7K2Q")
+	mustNoErr(t, err)
+	if covered != 3*osaudit.ChunkSize {
+		t.Fatalf("log covers %d bytes, want three chunks", covered)
+	}
+	mustNoErr(t, l.Verify())
+}
+
+func TestRecordingClosedCoversEverything(t *testing.T) {
+	l := openLog(t)
+	var buf bytes.Buffer
+	r := osaudit.NewRecorder(&buf, l, "E-AAAA", "alice")
+	mustNoErr(t, r.Input([]byte("id -u\r")))
+	writeN(t, r, 70*1024)
+	mustNoErr(t, r.Close("exit"))
+	covered, err := osaudit.VerifyRecordingPrefix(buf.Bytes(), l, "E-AAAA")
+	mustNoErr(t, err)
+	if covered != buf.Len() {
+		t.Fatalf("covered %d of %d bytes", covered, buf.Len())
+	}
+}
+
+func TestRecordingTamperDetected(t *testing.T) {
+	l := openLog(t)
+	var buf bytes.Buffer
+	r := osaudit.NewRecorder(&buf, l, "E-BBBB", "alice")
+	writeN(t, r, 100*1024)
+	mustNoErr(t, r.Close("time box"))
+	data := bytes.Clone(buf.Bytes())
+	data[10] ^= 0x01
+	if err := osaudit.VerifyRecording(data, l, "E-BBBB"); err == nil {
+		t.Fatal("a changed recording verified")
+	}
+	if err := osaudit.VerifyRecording(append(bytes.Clone(buf.Bytes()), "more\n"...), l, "E-BBBB"); err == nil {
+		t.Fatal("a recording with bytes after its end verified")
+	}
+	if err := osaudit.VerifyRecording(buf.Bytes()[:osaudit.ChunkSize], l, "E-BBBB"); err == nil {
+		t.Fatal("a truncated recording verified")
+	}
+}
+
+func TestRecordingIsAsciicast(t *testing.T) {
+	l := openLog(t)
+	var buf bytes.Buffer
+	r := osaudit.NewRecorder(&buf, l, "E-CCCC", "alice")
+	mustNoErr(t, r.Input([]byte("ls\r")))
+	_, err := r.Write([]byte("bin\r\n"))
+	mustNoErr(t, err)
+	sc := bufio.NewScanner(&buf)
+	sc.Scan()
+	var header map[string]any
+	mustNoErr(t, json.Unmarshal(sc.Bytes(), &header))
+	if header["version"] != float64(2) {
+		t.Fatalf("header %v", header)
+	}
+	var kinds []string
+	for sc.Scan() {
+		var ev []any
+		mustNoErr(t, json.Unmarshal(sc.Bytes(), &ev))
+		kinds = append(kinds, ev[1].(string))
+	}
+	if strings.Join(kinds, ",") != "i,o" {
+		t.Fatalf("event kinds %v, want both directions", kinds)
+	}
+}
+
+// A normal session's recording entries read ok, as every audit entry's
+// outcome is ok or refused; the end's reason is in its detail.
+func TestRecordingEntriesReadOk(t *testing.T) {
+	l := openLog(t)
+	var buf bytes.Buffer
+	r := osaudit.NewRecorder(&buf, l, "E-BBBB", "alice")
+	writeN(t, r, 70*1024)
+	mustNoErr(t, r.Close("exit"))
+	entries, err := l.Entries()
+	mustNoErr(t, err)
+	seen := 0
+	for _, e := range entries {
+		if e.Action != osaudit.ActionRecordingChunk && e.Action != osaudit.ActionRecordingEnd {
+			continue
+		}
+		seen++
+		if e.Outcome != "ok" {
+			t.Errorf("%s outcome %q, want ok", e.Action, e.Outcome)
+		}
+		if e.Action == osaudit.ActionRecordingEnd && e.Detail["reason"] != "exit" {
+			t.Errorf("end reason %q", e.Detail["reason"])
+		}
+	}
+	if seen != 3 {
+		t.Fatalf("%d recording entries", seen)
+	}
+}
