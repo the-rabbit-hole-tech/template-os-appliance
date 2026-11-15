@@ -12,7 +12,7 @@ source "$ROOT/.claude/hooks/lib.sh"
 
 is_binary() {
   case "$1" in
-    *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.ico|*.svg|*.woff|*.woff2|*.ttf|*.eot|*.zip|*.gz|*.jar|*.keystore) return 0 ;;
+    *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.ico|*.svg|*.woff|*.woff2|*.ttf|*.eot|*.zip|*.gz|*.jar|*.keystore|*.dotx|*.potx|*.pptx) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -25,6 +25,7 @@ tells_exempt() {
     governance/*|*/governance/*) return 0 ;;
     .github/workflows/*|*workflows/*.yml|*workflows/*.yaml) return 0 ;;
     *forbidden-text.txt) return 0 ;;
+    gen/*) return 0 ;;
     *) return 1 ;;
   esac
 }

@@ -1,7 +1,7 @@
 name: PR Checks
 # Authoritative CI enforcement of what the local hooks check (hooks are advisory
-# and may not be installed): conventional PR title, no AI-tells/emoji in the
-# diff, a PR body that follows the template + references an issue, and the
+# and may not be installed): conventional PR title, a DCO sign-off on every
+# commit, no AI-tells/emoji in the diff, a PR body that follows the template + references an issue, and the
 # gitleaks secret scan.
 #
 # ONE job, with each check as a step. Each of these checks does a few seconds of
@@ -27,17 +27,17 @@ permissions:
   pull-requests: read
 jobs:
   checks:
-    name: ✅ PR Checks
+    name: PR Checks
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: 📝 PR Title
-        uses: amannn/action-semantic-pull-request@v5
+      - name: PR Title
+        uses: amannn/action-semantic-pull-request@0723387faaf9b38adef4775cd42cfd5155ed6017  # v5.5.3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 📋 PR Body
+      - name: PR Body
         if: ${{ !cancelled() }}
         env:
           BODY: ${{ github.event.pull_request.body }}
@@ -61,11 +61,21 @@ jobs:
       - name: Checkout
         id: checkout
         if: ${{ !cancelled() }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
           fetch-depth: 0
 
-      - name: 🧼 PR Hygiene
+      # Every commit carries a "Signed-off-by: Name <email>" line (DCO, docs/dco.md).
+      # The checkout above has the full history; the rule lives in build/ci/dco.sh
+      # so the shell test and this step run the same code.
+      - name: DCO sign-off
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: bash build/ci/dco.sh "$BASE" "$HEAD"
+
+      - name: PR Hygiene
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -76,6 +86,8 @@ jobs:
           fail=0
           while IFS= read -r f; do
             [ -f "$f" ] || continue
+            # Binary data (e.g. a hashed word list) has no text to scan.
+            grep -qI '' "$f" || continue
             case "$f" in
               .git/*) continue ;;
               *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.ico|*.svg|*.woff|*.woff2|*.ttf|*.eot|*.zip|*.gz) continue ;;
@@ -85,7 +97,10 @@ jobs:
               .github/*|*.md|NOTES.txt|*/NOTES.txt) : ;;
               *) e="$(gov_find_emoji < "$f")"; [ -n "$e" ] && { echo "emoji not allowed in $f:"; echo "$e"; fail=1; } ;;
             esac
-            # AI-tells blocked except in files that document the rule.
+            # AI-tells blocked except in files that document the rule, and in
+            # generated code (Go's "Code generated ... DO NOT EDIT." header before
+            # the package clause), whose wording comes from the generator.
+            sed '/^package /q' "$f" | grep -qE '^// Code generated .* DO NOT EDIT\.$' && continue
             case "$f" in
               CLAUDE.md|*/CLAUDE.md|.claude/*|*/.claude/*|.github/workflows/*|*forbidden-text.txt) : ;;
               *) t="$(gov_find_file_tells "$f")"; [ -n "$t" ] && { echo "AI-tell not allowed in $f:"; echo "$t"; fail=1; } ;;
@@ -123,7 +138,7 @@ jobs:
           echo "$bin" >> "$GITHUB_PATH"
           "$bin/gitleaks" version
 
-      - name: 🔒 Gitleaks (secret scan)
+      - name: Gitleaks (secret scan)
         if: ${{ !cancelled() && steps.gitleaks-install.outcome == 'success' }}
         run: |
           # Honor a repo-local .gitleaks.toml if present; scan the full tree.

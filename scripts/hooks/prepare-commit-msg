@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Copyright 2026 The Rabbit Hole Tech, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Git prepare-commit-msg hook: adds the DCO "Signed-off-by: Name <email>" line
+# from your git identity when the message has none, the same line
+# `git commit -s` writes (see DCO and docs/dco.md). Install it with
+# scripts/install-dco-hook.sh.
+#
+# Refs the repo's issue #52.
+set -euo pipefail
+
+msg_file="$1"
+source="${2:-}"
+
+# A merge or squash message is not a contribution of its own.
+case "$source" in merge|squash) exit 0 ;; esac
+
+git interpret-trailers --in-place --if-exists doNothing \
+  --trailer "Signed-off-by: $(git var GIT_COMMITTER_IDENT | sed -E 's/^(.*>) [0-9]+ [-+][0-9]{4}$/\1/')" \
+  "$msg_file"

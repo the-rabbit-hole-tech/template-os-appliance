@@ -20,7 +20,7 @@ name: Label Checker
 # runner.
 #
 # Draft PRs are skipped; the label is applied when the PR is marked ready. The
-# label comes from the title, so this workflow keeps `edited` (a retitled PR is
+# label comes from the title, so this workflow keeps `edited`(a retitled PR is
 # relabeled); the build and security workflows do not react to edits.
 on:
   pull_request:
@@ -32,7 +32,7 @@ permissions:
   contents: read
 jobs:
   autolabel:
-    name: 🏷️ Autolabel
+    name: Autolabel
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -90,7 +90,7 @@ jobs:
             });
 
   categorizing-label:
-    name: ✅ Categorizing label present
+    name: Categorizing label present
     needs: [autolabel]
     # Run even if autolabel was skipped/failed; the label may already be present
     # from the PR title. Drafts are still skipped.

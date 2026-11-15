@@ -18,18 +18,19 @@ permissions:
   contents: read
 jobs:
   actionlint:
-    name: 🧹 Actionlint
+    name: Actionlint
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@v4
-      - name: 🐹 Setup Go
-        uses: actions/setup-go@v5
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "stable"
-      - name: 🧹 Run actionlint
+          cache: false
+      - name: Run actionlint
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@latest
           "$(go env GOPATH)/bin/actionlint" -color -shellcheck=
