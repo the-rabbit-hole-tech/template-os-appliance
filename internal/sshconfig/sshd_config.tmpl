@@ -1,0 +1,50 @@
+# Rendered by accessd from the access store; changes here are overwritten.
+{{- range .ListenAddrs}}
+ListenAddress {{.}}
+{{- end}}
+{{- range .HostKeys}}
+HostKey {{.}}
+{{- end}}
+{{- range .HostCertificates}}
+HostCertificate {{.}}
+{{- end}}
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AuthorizedKeysFile none
+TrustedUserCAKeys {{.UserCA}}
+DisableForwarding yes
+PermitTunnel no
+PermitUserRC no
+PermitUserEnvironment no
+StrictModes yes
+RevokedKeys {{.RevokedKeys}}
+ExposeAuthInfo yes
+ForceCommand {{.Shell}}
+Banner {{.Banner}}
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 60
+ClientAliveCountMax 3
+LogLevel VERBOSE
+PidFile {{.PidFile}}
+{{- if .AllowUsers}}
+AllowUsers {{join .AllowUsers " "}}
+{{- else}}
+DenyUsers *
+{{- end}}
+PubkeyAcceptedAlgorithms {{join .PubkeyAlgorithms ","}}
+HostKeyAlgorithms {{join .HostKeyAlgorithms ","}}
+KexAlgorithms {{join .KexAlgorithms ","}}
+Ciphers {{join .Ciphers ","}}
+MACs {{join .MACs ","}}
+{{- if .SessionPath}}
+SshdSessionPath {{.SessionPath}}
+{{- end}}
+{{- if .AuthPath}}
+SshdAuthPath {{.AuthPath}}
+{{- end}}
+# No Subsystem lines: no sftp, no scp.

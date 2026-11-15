@@ -1,0 +1,375 @@
+#!/bin/sh
+# Copyright 2026 The Example Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# k0s-interim prepare|run: k0s's pre-start hook and its launcher
+# (os/rootfs/services.d/k0s.yaml). INTERIM: it stands in for
+# appliance-platformd (#99), which renders the config, owns the data
+# directory and the node's address, and starts k0s; it does only what k0s
+# can't start without on a read-only, systemd-free root. docs/k0s.md has
+# the layout. busybox's sh here has no arithmetic: counters are strings.
+#
+# k0s itself, its images and its stacks come from the installed product
+# bundle's current slot (internal/product), never from the base root; the
+# service entry doesn't start without one (start-when).
+set -eu
+data=/var/lib/k0s
+product=/var/lib/appliance/product/current
+# The node's name is the box's own name, which init makes once per box and
+# keeps on the state volume (internal/boxname; a box that had a k0s node
+# name keeps it), so it doesn't follow the host name netd sets and stays
+# unique when more nodes join (spec 3, Section 2.12).
+name_file=/var/lib/appliance/box-name
+# The API and node address on the appl0 dummy interface (spec 3): a
+# DHCP change on a real interface never changes it, its certificates or
+# etcd's peer address. RFC 2544 space, never routed.
+node_ip=198.18.0.1
+# spec.network.serviceCIDR in k0s.yaml.tmpl (os/k0s/config_test.go).
+service_cidr=10.96.0.0/12 # scrub:allow=private-ip -- the k0s default
+# prepare's record on the state volume, so a failed pre-start's step
+# survives a reboot (the console log is on tmpfs): each run's lines, its
+# pid, and the step it failed at. Held to 64 KiB, then prepare.log.1.
+plog=/var/lib/appliance/k0s/prepare.log
+plog_max=65536
+step=""
+say() {
+  echo "k0s-interim: $*"
+  [ -z "$step" ] || echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$$] $*" >> "$plog" 2>/dev/null || :
+}
+
+# prepare_exit is prepare's EXIT trap: a failure names the step it was at.
+prepare_exit() {
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    say "prepare failed at the step \"$step\" (exit $rc)"
+  fi
+}
+
+# prepare_log starts this run's record, rolling the file over at its cap.
+prepare_log() {
+  mkdir -p "${plog%/*}"
+  if [ -f "$plog" ] && [ "$(wc -c < "$plog")" -gt "$plog_max" ]; then
+    mv -f "$plog" "$plog.1"
+  fi
+  step=start
+  trap prepare_exit EXIT
+  say "prepare starts"
+}
+
+# link_images <slot> <dir>: k0s's airgap images, as links into the slot.
+# A link this slot also has is replaced by rename and one it lacks is
+# removed, a link already gone counting as removed; no step of it fails
+# because a link changed under it, and k0s never finds a half-made one (a
+# new link is made under a dot name that isn't an archive's, then renamed).
+link_images() {
+  mkdir -p "$2"
+  for l in "$2"/*.tar; do
+    [ -L "$l" ] || continue
+    [ -f "$1/images/$(basename "$l")" ] && continue
+    rm -f "$l" 2>/dev/null || [ ! -L "$l" ]
+  done
+  n=""
+  for f in "$1"/images/*.tar; do
+    [ -f "$f" ] || continue
+    t="$2/.$(basename "$f").$$"
+    ln -s "$f" "$t"
+    mv -f "$t" "$2/$(basename "$f")"
+    n="$n."
+  done
+}
+
+# kubelet_resolv <host file> <out>: the kubelet's resolver file, which the
+# pods with dnsPolicy Default get, CoreDNS among them. CoreDNS forwards
+# what isn't the cluster's to the servers there and exits at start with
+# none, and the box runs with no DNS server (spec 1). Then the file names
+# the node address instead, where nothing serves DNS: cluster names still
+# resolve and the rest fail.
+kubelet_resolv() {
+  if grep -q '^nameserver ' "$1" 2>/dev/null; then
+    cp "$1" "$2.new"
+  else
+    { grep -v '^nameserver ' "$1" 2>/dev/null || :; echo "nameserver $node_ip"; } > "$2.new"
+  fi
+  mv "$2.new" "$2"
+}
+
+# cni_plugins <installed> <copy>: the box's own copy of the CNI plugins,
+# which containerd runs (containerd.toml bin_dirs, ahead of /opt/cni/bin).
+# kube-router's install-cni-bins rewrites every plugin in /opt/cni/bin in
+# place each time its pod starts, and after a reboot containerd is already
+# running them for the other pods: an exec of a plugin open for writing
+# fails with ETXTBSY, and libcni v1.3's retry of it with "exec: already
+# started", a FailedCreatePodSandBox. Nothing writes the copy while k0s
+# runs; a changed plugin goes in by rename at the next start. busybox has
+# no cmp, so a plugin is compared by its SHA-256.
+cni_plugins() {
+  mkdir -p "$2"
+  for f in "$1"/*; do
+    [ -f "$f" ] || continue
+    n="$(basename "$f")"
+    if [ -f "$2/$n" ] && [ "$(sha256sum < "$f")" = "$(sha256sum < "$2/$n")" ]; then
+      continue
+    fi
+    cp "$f" "$2/$n.new"
+    chmod 0755 "$2/$n.new"
+    mv "$2/$n.new" "$2/$n"
+  done
+}
+
+# exposed_rbac <slot> <stack dir>: the RBAC the appliance rendered for the
+# values the bundle's product.yaml exposes (internal/productspec) as its
+# own stack, so the appliance's service account may get exactly those
+# Secrets. A bundle that exposes none leaves no stack; k0s deletes what a
+# removed stack held.
+exposed_rbac() {
+  if [ -s "$1/exposed-rbac.yaml" ]; then
+    mkdir -p "$2"
+    cp "$1/exposed-rbac.yaml" "$2/exposed-rbac.yaml.new"
+    mv "$2/exposed-rbac.yaml.new" "$2/exposed-rbac.yaml"
+    say "the product's exposed values RBAC is in place"
+  elif [ -d "$2" ]; then
+    rm -rf "$2"
+    say "the product exposes no values; their RBAC goes"
+  fi
+}
+
+# switched_off <slot> <stack> <state file>: whether a switch the bundle
+# declares gates the stack and is off (internal/productswitch): the state
+# an admin set on :8443, else the default the slot records.
+switched_off() {
+  [ -s "$1/switch-stacks" ] || return 1
+  while read -r sw st def; do
+    [ "$st" = "$2" ] || continue
+    v="$def"
+    if [ -s "$3" ]; then
+      while read -r name val; do
+        if [ "$name" = "$sw" ]; then v="$val"; fi
+      done < "$3"
+    fi
+    [ "$v" = off ] && return 0
+    return 1
+  done < "$1/switch-stacks"
+  return 1
+}
+
+# phase_stack <slot> <stack>: whether the stack is one of a phase's
+# (productspec.PhaseStacksFile, "<order> <phase> <stack>" per line). The
+# box's phase loop (internal/productup) places those one phase at a time
+# once the cluster is up, so k0s never starts the whole product at once.
+phase_stack() {
+  [ -s "$1/phase-stacks" ] || return 1
+  while read -r _ _ st; do
+    [ "$st" = "$2" ] && return 0
+  done < "$1/phase-stacks"
+  return 1
+}
+
+# unplace_phases <list> <manifests>: take away every stack the phase loop
+# placed (productup.PlacedFile, one stack name per line) and empty the
+# list, so a stack the next slot has no phase for doesn't stay behind; the
+# slot's own phase stacks wait for the loop again. A name with a slash is
+# never one of them.
+unplace_phases() {
+  [ -s "$1" ] || return 0
+  while read -r st; do
+    case "$st" in */*|.*|"") continue ;; esac
+    rm -rf "${2:?}/$st"
+  done < "$1"
+  : > "$1"
+}
+
+# place_stack <slot stack dir/> <stack dir> <slot box-values> <box values>
+# <kernel host>: the stack's files, with each placeholder the bundle
+# declares (product.yaml box_values) replaced by the box's own value: the
+# one recorded at the last apply, host name change or (for the Base OS and
+# Base Web versions) boot, else, for box.fqdn, the kernel's host name.
+# internal/boxvalues does the same in Go for productswitch. The values are
+# host names, addresses and versions ([A-Za-z0-9.:[]+_-]), so they need no
+# quoting in sed; the placeholders' dots are escaped.
+place_stack() {
+  expr=""
+  if [ -s "$3" ]; then
+    while read -r ph vname; do
+      v=""
+      if [ -s "$4" ]; then
+        while read -r n val; do
+          if [ "$n" = "$vname" ]; then v="$val"; fi
+        done < "$4"
+      fi
+      if [ -z "$v" ] && [ "$vname" = box.fqdn ]; then v="$5"; fi
+      [ -n "$v" ] || continue
+      expr="$expr;s/$(echo "$ph" | sed 's/[.]/\\./g')/$v/g"
+    done < "$3"
+  fi
+  mkdir -p "$2"
+  for f in "$1"*.yaml; do
+    [ -f "$f" ] || continue
+    if [ -n "$expr" ]; then
+      sed "${expr#;}" "$f" > "$2/$(basename "$f")"
+    else
+      cp "$f" "$2/"
+    fi
+  done
+}
+
+# box_tls <crt> <key> <stack dir>: the box-tls Secret in appliance-edge
+# with the chain and key, and the Traefik dynamic config that makes them
+# the default certificate (traefik-tls.yaml), which the edge mounts next to
+# its routes and reloads live. internal/productedge renders the same.
+box_tls() {
+  mkdir -p "$3"
+  umask 077
+  {
+    printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: appliance-edge\n---\n'
+    printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: box-tls\n  namespace: appliance-edge\ntype: kubernetes.io/tls\nstringData:\n'
+    printf '  tls.crt: |\n'; sed 's/^/    /' "$1"
+    printf '  tls.key: |\n'; sed 's/^/    /' "$2"
+    printf '  traefik-tls.yaml: |\n'
+    printf '    tls:\n      stores:\n        default:\n          defaultCertificate:\n'
+    printf '            certFile: |\n'; sed 's/^/              /' "$1"
+    printf '            keyFile: |\n'; sed 's/^/              /' "$2"
+  } > "$3/box-tls.yaml.new"
+  mv "$3/box-tls.yaml.new" "$3/box-tls.yaml"
+  umask 022
+}
+
+prepare() {
+  prepare_log
+  # A product reset's record with no reset running is a reset that was cut
+  # off: the product may have no data or secrets left, and starting it
+  # would make new ones (docs/upgrades.md#removing-the-product).
+  step="a product reset that was cut off"
+  if [ -e /var/lib/appliance/platform/product-reset.json ] && [ ! -e /run/appliance/product-reset-running ]; then
+    say "a product reset was cut off; the product stays stopped, and the box finishes the reset"
+    exit 1
+  fi
+  step="the installed product bundle"
+  if [ ! -s "$product/bundle.json" ] || [ ! -x "$product/k0s" ]; then
+    say "no product bundle is installed; k0s comes with it (Updates)"
+    exit 1
+  fi
+  # cgroup v2 for containerd and the kubelet.
+  step="cgroup2"
+  if ! grep -q '^[^ ]* /sys/fs/cgroup cgroup2 ' /proc/mounts; then
+    mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup
+    say "mounted cgroup2 on /sys/fs/cgroup"
+  fi
+
+  step="the box's name"
+  if [ ! -s "$name_file" ]; then
+    say "the box has no name of its own yet ($name_file); init makes it at boot"
+    exit 1
+  fi
+  read -r name < "$name_file"
+  say "node $name"
+  # /etc/machine-id leads here.
+  if [ ! -s /var/lib/appliance/machine-id ]; then
+    read -r uuid < /proc/sys/kernel/random/uuid
+    echo "$uuid" | tr -d - > /var/lib/appliance/machine-id.new
+    mv /var/lib/appliance/machine-id.new /var/lib/appliance/machine-id
+  fi
+
+  step="the appl0 address and the service route"
+  if ! ip link show appl0 >/dev/null 2>&1; then
+    ip link add appl0 type dummy
+  fi
+  ip link set appl0 up
+  if ! ip -4 addr show dev appl0 | grep -q "inet $node_ip/"; then
+    ip addr add "$node_ip/32" dev appl0
+  fi
+  # A ClusterIP is only rewritten by kube-proxy's DNAT after the kernel has
+  # found a route for it; with none (a management network with no gateway)
+  # connect() fails with "network is unreachable", and kube-router can't
+  # reach the API through the kubernetes Service. Routing the Service range on appl0 keeps
+  # the cluster off the management network's gateway, like its address.
+  ip route replace "$service_cidr" dev appl0 src "$node_ip"
+
+  step="the k0s config"
+  mkdir -p /run/appliance/k0s
+  sed "s/@NODE_NAME@/$name/g" /etc/k0s/k0s.yaml.tmpl > /run/appliance/k0s/k0s.yaml
+
+  step="the CNI plugins"
+  # The root's /etc/cni and /opt are links to these, where kube-router
+  # installs the CNI config and plugins.
+  mkdir -p /var/lib/cni-conf/net.d /var/lib/opt/cni/bin
+  # containerd runs this copy, never the installer's files (cni_plugins).
+  cni_plugins /var/lib/opt/cni/bin /var/lib/appliance/k0s/cni-bin
+  say "the CNI plugins containerd runs: $(ls /var/lib/appliance/k0s/cni-bin | tr '\n' ' ')"
+  # /var/log leads here (pod logs).
+  mkdir -p /var/lib/log
+  step="the kubelet's resolver"
+  # netd writes the host's resolver file; until it has, an empty one. The
+  # kubelet gets its own, made from it.
+  [ -e /run/appliance/resolv.conf ] || : > /run/appliance/resolv.conf
+  kubelet_resolv /run/appliance/resolv.conf /run/appliance/k0s/resolv.conf
+  say "the kubelet's resolver: $(grep '^nameserver ' /run/appliance/k0s/resolv.conf | tr '\n' ' ')"
+
+  # The airgap images: k0s imports every archive in $data/images when its
+  # worker starts. Links into the current product slot, so the images
+  # aren't copied; links an earlier bundle left are replaced
+  # (link_images).
+  step="the image links"
+  # The shell's own cd -P, not readlink -f: the box's busybox has no
+  # readlink -f (os/k0s/busybox_test.go).
+  slot="$(cd -P "$product" && pwd)"
+  link_images "$slot" "$data/images"
+  say "linked ${#n} images from the product bundle $(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' "$product/bundle.json") into $data/images"
+
+  # Stacks k0s applies on its own: each <slot>/manifests/<name>/ is copied
+  # to $data/manifests/<name>/, replacing what an earlier bundle put there.
+  # A phase's stacks are taken away and left to the phase loop.
+  step="the product's stacks"
+  unplace_phases /var/lib/appliance/platform/phase-placed "$data/manifests"
+  for d in "$slot"/manifests/*/; do
+    [ -d "$d" ] || continue
+    stack="$(basename "$d")"
+    rm -rf "$data/manifests/$stack"
+    if phase_stack "$slot" "$stack"; then
+      say "stack $stack waits for its phase"
+      continue
+    fi
+    if switched_off "$slot" "$stack" /var/lib/appliance/platform/switches; then
+      say "stack $stack is off (its switch on :8443)"
+      continue
+    fi
+    place_stack "$d" "$data/manifests/$stack" "$slot/box-values" /var/lib/appliance/platform/box-values "$(cat /proc/sys/kernel/hostname)"
+    say "stack $stack in place"
+  done
+  step="the exposed values RBAC"
+  exposed_rbac "$slot" "$data/manifests/appliance-exposed"
+
+  # INTERIM, until Traefik comes with the platform (#102): the box-tls
+  # Secret for the edge, refreshed on every start: the certificate assigned
+  # to the Product (443) endpoint when there is one (internal/productedge,
+  # which also writes this stack live when it's assigned), else the box's
+  # own :8443 certificate (osadmin renews it). It stays on the encrypted
+  # state volume, in k0s's manifests and etcd.
+  step="the edge certificate"
+  tls=/var/lib/appliance/osadmin
+  assigned=/var/lib/appliance/platform/tls
+  if [ -s "$assigned/product.crt" ] && [ -s "$assigned/product.key" ]; then
+    box_tls "$assigned/product.crt" "$assigned/product.key" "$data/manifests/box-tls"
+    say "the certificate assigned to the product's edge is in place"
+  elif [ -s "$tls/tls.crt" ] && [ -s "$tls/tls.key" ]; then
+    box_tls "$tls/tls.crt" "$tls/tls.key" "$data/manifests/box-tls"
+    say "the box's certificate is in place for the edge"
+  fi
+  step="done"
+  say "prepare done"
+}
+
+run() {
+  read -r name < "$name_file"
+  # k0s puts its own binaries first; the kubelet finds mount(8) in /bin.
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  exec "$product/k0s" controller --enable-worker --no-taints \
+    --config /run/appliance/k0s/k0s.yaml --data-dir "$data" --profile appliance \
+    --disable-components konnectivity-server,metrics-server,update-prober,autopilot \
+    --kubelet-extra-args="--hostname-override=$name --node-ip=$node_ip --resolv-conf=/run/appliance/k0s/resolv.conf"
+}
+
+case "${1:-}" in
+  prepare) prepare ;;
+  run) run ;;
+  *) echo "usage: k0s-interim prepare|run" >&2; exit 2 ;;
+esac
