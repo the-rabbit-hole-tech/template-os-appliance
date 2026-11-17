@@ -1,0 +1,70 @@
+name: InitFixture
+# Proves the template still fills in and builds the way a product uses it:
+# build/tools/initproduct fills the four placeholders (TEMPLATE.md) with a
+# fictional product, Acme, and the filled tree is built, vetted, formatted,
+# linted and checked for licence headers. A path the tool cannot fill, or fills
+# wrongly, fails here and not in a product's first week.
+#
+# ONE job (GitHub bills every job for at least a minute), pull requests only and
+# not while the PR is a draft, like the other build workflows (see "CI and
+# Actions minutes" in CLAUDE.md). It checks out a throwaway runner workspace, so
+# filling the tree in place changes nothing that is kept.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  init-fixture:
+    name: Fill the template
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: Setup buf
+        uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6  # v1.7.0
+        with:
+          setup_only: true
+          version: 1.57.2
+      - name: Install the protobuf plugins
+        # The versions go.mod pins; scripts/proto-generate.sh needs them on PATH.
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go connectrpc.com/connect/cmd/protoc-gen-connect-go
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Test the init tool
+        run: go test ./build/tools/initproduct/
+      - name: Fill in the fixture product
+        run: |
+          go build -o "$RUNNER_TEMP/initproduct" ./build/tools/initproduct
+          "$RUNNER_TEMP/initproduct" --fixture
+      - name: Remove what only the template needs
+        # TEMPLATE.md step 4: the tool and the check that names the real organisation.
+        run: rm -rf build/tools/initproduct build/ci/org_name_test.sh
+      - name: Build and vet
+        run: |
+          go build ./...
+          go vet ./...
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed on:"; echo "$unformatted"; exit 1; fi
+      - name: Proto lint
+        run: buf lint
+      - name: Tests that follow the module path and the registry
+        run: go test ./build/tools/... ./internal/release/... ./cmd/appliance-kit/... ./test/kit/...
+      - name: Licence headers
+        env:
+          GOLIC_VERSION: v0.3.0
+        run: |
+          go install "github.com/Bugs5382/golic/cmd/golic@${GOLIC_VERSION}"
+          "$(go env GOPATH)/bin/golic" inject -t spdx-apache2 -c "2026 The Acme Authors" --dry -x
