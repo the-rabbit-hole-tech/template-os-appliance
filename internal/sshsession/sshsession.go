@@ -140,19 +140,22 @@ func (p *Proc) List() ([]Session, error) {
 func (p *Proc) End(id string) (Session, error) {
 	pid, ticks, ok := parseID(id)
 	if !ok {
-		return Session{}, ErrNotFound
+		return Session{}, refused("id %q is not ssh-<pid>-<start ticks>", id)
 	}
 	boot, err := p.bootTime()
 	if err != nil {
 		return Session{}, err
 	}
-	s, ok := p.session(pid, boot)
-	if !ok || s.ID != id {
-		return Session{}, ErrNotFound
+	s, err := p.inspect(pid, boot)
+	if err != nil {
+		return Session{}, refused("%v", err)
+	}
+	if s.ID != id {
+		return Session{}, refused("pid %d: started at tick %d, the id says %d", pid, ticksOf(s.ID), ticks)
 	}
 	st, err := p.stat(pid)
 	if err != nil {
-		return Session{}, ErrNotFound
+		return Session{}, refused("pid %d: stat read again before the hang-up: %v", pid, err)
 	}
 	if err := p.signal(pid, syscall.SIGHUP); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return s, fmt.Errorf("sshsession: hang up %d: %w", pid, err)
@@ -212,17 +215,43 @@ func (p *Proc) gone(pid int, ticks int64, d time.Duration) bool {
 	}
 }
 
+// refused is ErrNotFound with the check that refused and what it saw, for
+// the log. errors.Is(err, ErrNotFound) still holds.
+func refused(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrNotFound, fmt.Sprintf(format, args...))
+}
+
+// ticksOf is the start ticks in a session id the scanner built.
+func ticksOf(id string) int64 {
+	_, ticks, _ := parseID(id)
+	return ticks
+}
+
 func (p *Proc) session(pid int, boot time.Time) (Session, bool) {
-	if exe, err := p.exe(pid); err != nil || exe != p.shell() {
-		return Session{}, false
+	s, err := p.inspect(pid, boot)
+	return s, err == nil
+}
+
+// inspect reads pid as a closed-shell session, or says which check it
+// failed.
+func (p *Proc) inspect(pid int, boot time.Time) (Session, error) {
+	exe, err := p.exe(pid)
+	if err != nil {
+		return Session{}, fmt.Errorf("pid %d: no /proc entry (%v)", pid, err)
+	}
+	if exe != p.shell() {
+		return Session{}, fmt.Errorf("pid %d: runs %q, not the closed shell", pid, exe)
 	}
 	st, err := p.stat(pid)
-	if err != nil || st.state == 'Z' || st.state == 'X' {
-		return Session{}, false
+	if err != nil {
+		return Session{}, fmt.Errorf("pid %d: stat unreadable (%v)", pid, err)
+	}
+	if st.state == 'Z' || st.state == 'X' {
+		return Session{}, fmt.Errorf("pid %d: already ended (state %c)", pid, st.state)
 	}
 	uid, err := p.uid(pid)
 	if err != nil {
-		return Session{}, false
+		return Session{}, fmt.Errorf("pid %d: owner unreadable (%v)", pid, err)
 	}
 	started := boot.Add(time.Duration(st.ticks) * time.Second / clockTicks)
 	return Session{
@@ -231,7 +260,7 @@ func (p *Proc) session(pid int, boot time.Time) (Session, bool) {
 		Admin:   p.user(uid),
 		Source:  p.source(pid),
 		Started: started,
-	}, true
+	}, nil
 }
 
 func (p *Proc) path(pid int, name string) string {

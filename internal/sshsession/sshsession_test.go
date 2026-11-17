@@ -168,6 +168,32 @@ func TestEndRefusesAReusedOrUnknownID(t *testing.T) {
 	}
 }
 
+// A refusal says which check fired and what it saw, so a failure seen once
+// (issue #38) can be told from the other three without a reproduction. Each
+// still matches ErrNotFound for callers.
+func TestEndSaysWhichCheckRefused(t *testing.T) {
+	f := newFakeProc(t)
+	f.process(100, 90, 1001, shell, 99999)
+	f.process(300, 290, 0, "/usr/libexec/appliance-elevated", 1)
+	cases := []struct{ id, want string }{
+		{"ssh-x-1", "is not ssh-<pid>-<start ticks>"},
+		{"web-100-12345", "is not ssh-<pid>-<start ticks>"},
+		{"ssh-7-1", "pid 7: no /proc entry"},
+		{"ssh-300-1", `pid 300: runs "/usr/libexec/appliance-elevated", not the closed shell`},
+		{"ssh-100-12345", "pid 100: started at tick 99999, the id says 12345"},
+	}
+	for _, c := range cases {
+		_, err := f.scanner().End(c.id)
+		if !errors.Is(err, sshsession.ErrNotFound) {
+			t.Errorf("End(%q) = %v, want ErrNotFound", c.id, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("End(%q) = %q, want it to say %q", c.id, err, c.want)
+		}
+	}
+}
+
 func TestEndKillsAShellThatIgnoresTheHangup(t *testing.T) {
 	f := newFakeProc(t)
 	f.process(100, 90, 1001, shell, 12345)

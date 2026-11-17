@@ -132,6 +132,8 @@ func (h *power) EndSession(ctx context.Context, r *connect.Request[osadminv1.End
 	case strings.HasPrefix(id, sshPrefix) && h.s.o.Shells != nil:
 		sh, err := h.s.o.Shells.End(id)
 		if errors.Is(err, sshsession.ErrNotFound) {
+			// The client gets the plain not-found; the log says which check refused.
+			lg.Warn("osadmin: SSH session not found", log.F("by", c.session.Admin), log.F("id", id), log.F("reason", err.Error()))
 			return nil, notFound
 		}
 		c.noteID(sessionName(sh.Admin, "SSH session", sh.Source), "session", id, "kind", "ssh", "admin", sh.Admin, "source", sh.Source)
