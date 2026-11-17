@@ -41,3 +41,5 @@ task license  # check Apache-2.0 headers (golic)
 ## ⚖️ License
 
 Apache-2.0. See LICENSE and NOTICE; keep NOTICE in any copy or derivative.
+
+The cryptography the template uses, and what a product reviews for itself, is in `CRYPTO.md`.
